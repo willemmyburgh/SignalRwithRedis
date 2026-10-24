@@ -12,6 +12,43 @@ Horizontally scaled ASP.NET Core SignalR (.NET 10) behind an HAProxy load balanc
 - `src/LoadTest` – console load generator (N connections, a few publishers, reports delivery %, throughput and p50/p95/p99 latency).
 - `HAProxy/HAProxy.conf` – WebSocket-aware round-robin load balancer; re-resolves Docker DNS so scaling needs no restart.
 
+## Architecture: what happens by default
+
+```
+ browsers / load test ──WebSocket──► HAProxy :9000 (leastconn, /healthz) ──► server-1..N (SignalR hub /chat)
+                                                                                   │  pub/sub backplane + shared state
+                                                    Sentinel x3 ◄── "who is primary?" ┤
+                                                         │ monitor / promote          ▼
+                                                         └──────────────► Redis primary ──replicates──► replica 1, replica 2
+```
+
+**Connect.** A client opens one WebSocket (WebSockets only, no negotiate, so no sticky sessions). HAProxy picks the server with the fewest connections. The server resolves a device name, registers the client in the Redis roster, and answers with its identity and build stamp.
+
+**Send.** A hub call such as `SendMessage` makes the receiving server *publish* to a Redis pub/sub channel (`…:all`, `…:group:room:A`, `…:connection:<id>`). Redis forwards it to every subscribed server and each server writes to its own sockets. Redis does not store the message.
+
+**Background, every second or so.** Each server writes a heartbeat to `demo:servers`; the lowest-named live server (leader) aggregates heartbeats, roster and Redis INFO and pushes `ClusterStats` to all clients; every server checks whether it holds more than its share of connections and, if so, asks a batch of its clients to reconnect (HAProxy sends them to the emptiest server). Clients ping for RTT every 3 s; SignalR keep-alive is 5 s with a 15 s timeout; HAProxy health-checks every server every second; Sentinels watch Redis continuously.
+
+**Guarantee today: at most once.** Messages can be lost during a Redis failover (seconds), when a server is killed, while a client's socket is being swapped (drain, rebalance), and for any client that is offline. Measured: 98-100 % delivered across five failovers under load, ~1.3 % loss during a graceful drain, 100 % in steady state.
+
+The full picture with diagrams is in the architecture page that accompanies this repo (published as an artifact).
+
+## Proposal: a durable log (Redpanda / Kafka) for no message loss
+
+*Not built yet.* The idea is to stop treating Redis pub/sub as the source of truth.
+
+| Piece | Design |
+|---|---|
+| Log | 3-node Redpanda (Raft; Kafka API; one binary per node). Topic `chat.messages`, 12 partitions keyed by room/conversation, replication factor 3, `min.insync.replicas=2`, retention 24 h, named volumes. |
+| Send | Hub method produces with `acks=all` and an idempotent producer, and returns `{msgId, partition, offset}` only after the write is acknowledged. The client shows pending then persisted, and retries with the same `msgId`. |
+| Receive | Every server tails all partitions (one consumer group per server) and fans out to its local sockets. Pushes carry `(partition, offset)`. The client keeps the last offset per partition and drops duplicates. |
+| Resume | On any reconnect the client sends `resume(lastOffsets)`; the server replays from the log, merges with live messages by offset, then goes live. This covers server crash, drain, rebalance bounce and sleeping phones. |
+| Redis | Stays for ephemeral data: presence, cluster stats, poll, drawing strokes. It is no longer on the message path, so a Redis outage or failover no longer affects chat. |
+| Proof | Extend the load test: each sender numbers its messages; every receiver asserts contiguous numbers per sender. Chaos under load: kill/drain a server, Redis failover, stop one broker (continues), stop two brokers (writes refused, nothing silently lost). Pass = zero gaps, zero visible duplicates. |
+
+What "no loss" covers: any message the sender saw as persisted, delivered exactly once on screen to every client that returns within retention, as long as 2 of 3 brokers survive. It does not cover a message never acknowledged whose sender gave up, a client away longer than retention or with cleared offsets, simultaneous loss of two brokers' disks, or ordering between different rooms. `docker compose down` keeps the data on volumes; `down -v` deletes it.
+
+Alternatives considered: Kafka in KRaft mode (same design, heavier), Redis Streams (smallest change, but asynchronous replication can lose acknowledged writes on failover), NATS JetStream (lighter, less .NET tooling). Expected cost: about 5-10 ms extra per send for the replicated write.
+
 ## Run
 
 ```bash
