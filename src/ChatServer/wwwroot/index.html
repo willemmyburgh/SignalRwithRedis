@@ -47,6 +47,7 @@
   <div class="composer">
     <div class="chips"><span class="muted">Listening to <b>Everyone</b> +</span> <span id="rooms"></span></div>
     <div class="row"><select id="sendTo" aria-label="Send to"><option value="">👥 Everyone</option></select><input id="message" placeholder="Message" /><button id="send">Send</button></div>
+    <label class="muted durable"><input type="checkbox" id="durable" /> Durable: confirmed only when 2 of 3 Redpanda brokers hold it, replayed after reconnects</label>
   </div>
 </section>
 
@@ -117,7 +118,18 @@
   </div>
 
   <div class="card">
-    <h3>5 · Resilience</h3>
+    <h3>5 · Durable log: no message lost (audit)</h3>
+    <p class="hint">Every device sends numbered messages through the replicated log (Redpanda). Each receiver checks, per sender, that the numbers arrive without gaps. Start it, then crash a server, drain one, fail over Redis, or <code>docker compose stop redpanda-2</code>: <b>GAPS</b> must stay 0. A send that could not be persisted is retried with the same id until it is.</p>
+    <div class="row wrap">
+      <label>Per device <select id="dfloodRate"><option value="2">2/s</option><option value="5" selected>5/s</option><option value="20">20/s</option></select></label>
+      <label>For <select id="dfloodSecs"><option>20</option><option selected>60</option><option>180</option></select> s</label>
+      <button id="dfloodBtn">Start audited flood</button><button id="dfloodReset" class="ghost">Reset counters</button>
+    </div>
+    <div id="dfloodOut" class="muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>6 · Resilience</h3>
     <p class="hint"><b>Abrupt:</b> kills the instance you're on with no warning (like a power cut). Its clients notice, reconnect to the survivors and re-join their rooms; messages sent in the gap are lost.<br>
     <b>Graceful:</b> the instance leaves the load balancer, asks its clients to move in small waves, and only then exits (what a rolling upgrade does). Compare the "moved … in Ns" lines in the log.<br>
     <b>Redis failover:</b> Sentinel promotes a replica to primary. The app keeps serving; the Redis line in the cluster panel shows the new primary. (Try <code>docker compose stop redis-1</code> too.)</p>

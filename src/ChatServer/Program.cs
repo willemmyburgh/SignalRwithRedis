@@ -23,6 +23,12 @@ builder.Services.AddSignalR(o =>
 // Separate multiplexer for the demo's own shared state (poll, roster, server heartbeats).
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(RedisConfig.Create(builder.Configuration)));
 builder.Services.AddSingleton<RedisHa>();
+// Durable path: replicated log. LocalConnections + the wrapping lifetime manager let the log write to local sockets.
+builder.Services.AddSingleton<LocalConnections>();
+builder.Services.AddSingleton<ChatLog>();
+builder.Services.AddSingleton<LogDelivery>();
+builder.Services.AddSingleton(typeof(HubLifetimeManager<>), typeof(TrackingLifetimeManager<>));
+builder.Services.AddHostedService<ChatLogTail>();
 builder.Services.AddHostedService<ClusterReporter>();
 builder.Services.AddHostedService<GracefulDrain>();   // after ClusterReporter => stops first
 builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(28));
@@ -42,6 +48,7 @@ app.MapGet("/stats", (HttpContext http) => new
     connections = ServerStats.Connections,
     virtualConnections = ServerStats.VirtualConnections,
     hubCalls = ServerStats.Invocations,
+    log = new { appended = ServerStats.LogAppendedCount, delivered = ServerStats.LogDeliveredCount, replayed = ServerStats.LogReplayedCount, tailRestarts = ServerStats.LogTailRestarts },
 });
 
 app.Run();

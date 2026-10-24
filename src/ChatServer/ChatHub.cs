@@ -7,7 +7,7 @@ namespace ChatServer;
 
 public record ClientInfo(string Name, string Server, string Cid = "");
 
-public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubContext, IHostApplicationLifetime lifetime, RedisHa redisHa) : Hub
+public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubContext, IHostApplicationLifetime lifetime, RedisHa redisHa, LocalConnections local, ChatLog chatLog, LogDelivery delivery) : Hub
 {
     public static string ServerName { get; } = Environment.MachineName;
     // Lets open pages notice a newer deployment and reload themselves (see app.js).
@@ -112,8 +112,29 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
     public Task SendToRoom(string room, string user, string message, long sentTicks = 0) =>
         Clients.Group("room:" + Clean(room, 20)).SendAsync("RoomMessage", user, message, ServerName, room, sentTicks);
 
-    public Task JoinRoom(string room) => Groups.AddToGroupAsync(Context.ConnectionId, "room:" + Clean(room, 20));
-    public Task LeaveRoom(string room) => Groups.RemoveFromGroupAsync(Context.ConnectionId, "room:" + Clean(room, 20));
+    public Task JoinRoom(string room)
+    {
+        local.Join(Clean(room, 20), Context.ConnectionId);       // for the durable log path (local delivery)
+        return Groups.AddToGroupAsync(Context.ConnectionId, "room:" + Clean(room, 20));
+    }
+
+    public Task LeaveRoom(string room)
+    {
+        local.Leave(Clean(room, 20), Context.ConnectionId);
+        return Groups.RemoveFromGroupAsync(Context.ConnectionId, "room:" + Clean(room, 20));
+    }
+
+    // ---- durable path: replicated log (Redpanda) ---------------------------------------------------------------
+
+    /// <summary>
+    /// Appends to the replicated log and returns only after a majority of brokers hold the message. Throws (the client
+    /// keeps the message and retries with the same msgId) when it could not be persisted.
+    /// </summary>
+    public Task<DurableAck> SendDurable(string msgId, string room, string user, string text, long sentTicks = 0) =>
+        chatLog.AppendAsync(new LogEnvelope(Clean(msgId, 64), Clean(room ?? "", 20), Clean(user, 24), Clean(text, 2000), ServerName, sentTicks));
+
+    /// <summary>Reconnecting client: last offset seen per partition. Replays what it missed, then continues live.</summary>
+    public Task Resume(Dictionary<int, long> offsets) => delivery.ResumeAsync(Context.ConnectionId, offsets ?? []);
 
     // ---- shared canvas ------------------------------------------------------
 
@@ -251,6 +272,7 @@ public class CountingFilter : IHubFilter
 public static class ServerStats
 {
     private static int _connections, _virtual;
+    private static long _logAppended, _logDelivered, _logReplayed;
     private static long _invocations;
 
     public static volatile bool Draining, Stopped;
@@ -271,6 +293,15 @@ public static class ServerStats
     }
 
     public static void Invocation() => Interlocked.Increment(ref _invocations);
+    public static long LogAppendedCount => Interlocked.Read(ref _logAppended);
+    public static long LogDeliveredCount => Interlocked.Read(ref _logDelivered);
+    public static long LogReplayedCount => Interlocked.Read(ref _logReplayed);
+    private static long _tailRestarts;
+    public static long LogTailRestarts => Interlocked.Read(ref _tailRestarts);
+    public static void LogTailRestarted() => Interlocked.Increment(ref _tailRestarts);
+    public static void LogAppended() => Interlocked.Increment(ref _logAppended);
+    public static void LogDelivered() => Interlocked.Increment(ref _logDelivered);
+    public static void LogReplayed(int n) => Interlocked.Add(ref _logReplayed, n);
 }
 
 /// <summary>Ids of the connections currently attached to THIS server instance.</summary>

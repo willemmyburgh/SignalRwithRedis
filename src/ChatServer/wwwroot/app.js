@@ -1,6 +1,6 @@
 const $ = id => document.getElementById(id);
 const short = s => (s || "?").slice(0, 6);
-const state = { id: null, server: null, rooms: new Set(), virtual: [], rx: 0, flood: null, burst: null, reactions: 0 };
+const state = { offsets: JSON.parse(sessionStorage.getItem("offsets") || "{}"), id: null, server: null, rooms: new Set(), virtual: [], rx: 0, flood: null, burst: null, reactions: 0 };
 
 // ---------- helpers ----------
 // Each live server owns a colour slot (assigned by the cluster, see ClusterReporter), so colours are distinct and
@@ -84,6 +84,7 @@ conn.on("Connected", async (server, id, build) => {
     disconnectedAt = 0; rebalancing = "";
   }
   for (const r of [...state.rooms, ...(state.flood?.temp || [])]) await conn.invoke("JoinRoom", r); // groups are per-connection: re-join
+  try { await conn.invoke("Resume", state.offsets); } catch { /* durable log not available */ }   // replay what we missed
 });
 conn.onreconnecting(() => { disconnectedAt = performance.now(); lostServer = state.server; setStatus("reconnecting…", ""); log(`lost connection to ${short(state.server)}, retrying…`); });
 conn.onclose(() => { setStatus("disconnected", "bad"); });
@@ -136,21 +137,25 @@ conn.on("ClusterStats", s => {
     row.append(chip(x.name), bar, txt); return row;
   }));
   $("redisLine").textContent = s.redis.up ? `Redis ${s.redis.version} primary ${s.redis.primary} (${s.redis.replicas} replicas): ${s.redis.opsPerSec} ops/s · ${s.redis.connectedClients} connections · ${s.redis.memory}` : "Redis: no primary reachable (failing over?)";
+  if (s.log?.enabled) $("redisLine").textContent += s.log.up ? ` · Log (Redpanda): ${s.log.brokers} brokers, ${s.log.partitions} partitions` : " · Log (Redpanda): unreachable";
   $("clientsSummary").textContent = `Clients online (${s.clients.length})`;
   $("clients").replaceChildren(...s.clients.map(c => chip(c.server, c.name)));
 });
 conn.on("Notice", t => { log(t); });
 
 // ---------- chat ----------
-function addMsg(user, text, server, room) {
+function addMsg(user, text, server, room, extra) {
   state.rx++;
   const li = document.createElement("li");
   if (user === name) li.className = "mine";
   const aud = document.createElement("span"); aud.className = "aud" + (room ? " room" : "");
   aud.textContent = room ? `🔒 Room ${room} only` : "👥 Everyone";
   const who = document.createElement("span"); who.className = "who"; who.textContent = user;
-  li.append(chip(server), aud, who, `: ${text}`); $("messages").prepend(li);
+  li.append(chip(server), aud, who, `: ${text}`);
+  if (extra) { const x = document.createElement("span"); x.className = "aud log"; x.textContent = extra; li.append(" ", x); }
+  $("messages").prepend(li);
   while ($("messages").children.length > 100) $("messages").lastChild.remove();
+  return li;
 }
 conn.on("ReceiveMessage", (u, m, s) => addMsg(u, m, s));
 conn.on("RoomMessage", (u, m, s, room) => addMsg(u, m, s, room));
@@ -168,7 +173,8 @@ for (const r of ["A", "B", "C"]) {
 $("send").onclick = async () => {
   const m = $("message").value.trim(); if (!m) return;
   const room = $("sendTo").value;
-  await (room ? conn.invoke("SendToRoom", room, name, m) : conn.invoke("SendMessage", name, m, 0));
+  if ($("durable").checked) queueDurable(room, m);
+  else await (room ? conn.invoke("SendToRoom", room, name, m) : conn.invoke("SendMessage", name, m, 0));
   $("message").value = "";
 };
 $("message").onkeydown = e => { if (e.key === "Enter") $("send").click(); };
@@ -341,8 +347,84 @@ conn.on("Command", (cmd, a, b, by, arg) => {
   log(`command from ${by}: ${cmd} ${a || ""} ${b || ""}`);
   if (cmd === "virtual") addVirtual(a);
   else if (cmd === "flood") startFlood(a, b, arg || "everyone");
-  else if (cmd === "stop") { stopFlood(true); closeVirtual(); }
+  else if (cmd === "dflood") startDurableFlood(a, b);
+  else if (cmd === "stop") { stopFlood(true); stopDurableFlood(); closeVirtual(); }
 });
+
+// ---------- durable log (replicated, replayable) ----------
+// A durable send is shown as pending until the server confirms that a majority of brokers hold it; unconfirmed sends are
+// retried with the SAME id, so a retry can never show twice. Every delivered message carries (partition, offset);
+// the highest offset per partition is remembered, and sent back on reconnect so the server replays what was missed.
+const seenOff = new Set(), seenIds = new Set(), pending = new Map();
+const audit = { senders: {}, got: 0, dupCopies: 0, replayDup: 0, replayed: 0, sent: 0, acked: 0 };
+const saveOffsets = () => { try { sessionStorage.setItem("offsets", JSON.stringify(state.offsets)); } catch { /* storage unavailable */ } };
+const remember = (set, key, max = 20000) => { set.add(key); if (set.size > max) set.delete(set.values().next().value); };
+let dseq = 0;
+function queueDurable(room, text, opts = {}) {
+  const id = opts.id || `${cid}-${Date.now().toString(36)}-${(dseq++).toString(36)}`;
+  const m = { id, room, user: name, text, li: opts.audit ? null : addMsg(name, text, state.server, room, "⏳ sending"), busy: false };
+  pending.set(id, m); trySend(id);
+}
+async function trySend(id) {
+  const m = pending.get(id); if (!m || m.busy || conn.state !== "Connected") return;
+  m.busy = true;
+  try {
+    const ack = await conn.invoke("SendDurable", m.id, m.room, m.user, m.text, 0);
+    if (m.audit) audit.acked++;
+    if (m.li) m.li.querySelector(".log").textContent = `✓ persisted p${ack.partition}@${ack.offset}`;
+    if (m.room !== "" && !state.rooms.has(m.room)) pending.delete(id);   // not a member: it will never come back to us
+    else if (m.audit) pending.delete(id);                                  // audit traffic has no bubble to wait for
+  } catch { /* not persisted: stays pending, retried by the timer */ }
+  finally { m.busy = false; }
+}
+setInterval(() => { for (const id of pending.keys()) trySend(id); }, 2000);
+
+conn.on("LogMessage", (p, o, id, room, user, text, origin, sentTicks, tsMs) => {
+  state.rx++;
+  const key = p + ":" + o;
+  if (seenOff.has(key)) { audit.replayDup++; return; }          // the same record twice (replay overlapped live)
+  remember(seenOff, key);
+  if ((state.offsets[p] ?? -1) < o) { state.offsets[p] = o; saveOffsets(); }
+  if (seenIds.has(id)) { audit.dupCopies++; return; }           // a retry that produced a second record: hidden
+  remember(seenIds, id);
+  if (text.startsWith("#audit|")) {
+    const [, who, seqText] = text.split("|"), seq = +seqText;
+    const a = audit.senders[who] ||= { min: seq, max: seq, got: new Set() };
+    a.min = Math.min(a.min, seq); a.max = Math.max(a.max, seq); a.got.add(seq); audit.got++;
+    return;
+  }
+  const m = pending.get(id); if (m) { m.li?.remove(); pending.delete(id); }
+  addMsg(user, text, origin, room, `📜 p${p}@${o}`);
+});
+conn.on("Replayed", (n, truncated) => {
+  audit.replayed += n;
+  log(`resume: replayed ${n} missed message(s)` + (truncated ? " (older history is gone: beyond retention)" : ""));
+  if (n && !$("durable").checked) $("durable").checked = true;
+});
+
+let dflood = null;
+function startDurableFlood(rate, secs) {
+  stopDurableFlood();
+  for (const k of Object.keys(audit.senders)) delete audit.senders[k];
+  Object.assign(audit, { got: 0, dupCopies: 0, replayDup: 0, replayed: 0, sent: 0, acked: 0 });
+  let seq = 0; const until = performance.now() + secs * 1000;
+  dflood = setInterval(() => {
+    if (performance.now() > until) return stopDurableFlood(true);
+    const id = `${cid}-${seq}`;
+    pending.set(id, { id, room: "", user: name, text: `#audit|${cid}|${seq}`, li: null, audit: true, busy: false });
+    seq++; audit.sent++; trySend(id);
+  }, 1000 / rate);
+  log(`durable flood: ${rate}/s for ${secs}s`);
+}
+function stopDurableFlood(done) { if (dflood) { clearInterval(dflood); dflood = null; if (done) log("durable flood finished (unconfirmed sends keep retrying)"); } }
+setInterval(() => {
+  const senders = Object.values(audit.senders);
+  if (!senders.length && !audit.sent) return;
+  const gaps = senders.reduce((n, a) => n + (a.max - a.min + 1 - a.got.size), 0);
+  $("dfloodOut").textContent = `${dflood ? "running" : "idle"} · sent ${audit.sent}, confirmed ${audit.acked}, still pending ${[...pending.values()].filter(x => x.audit).length} · received ${audit.got} from ${senders.length} senders · GAPS ${gaps} · hidden duplicate records ${audit.dupCopies} · replay overlaps ${audit.replayDup} · replayed after reconnects ${audit.replayed}`;
+}, 500);
+$("dfloodBtn").onclick = () => $("onAll").checked ? conn.invoke("RunOnAll", "dflood", +$("dfloodRate").value, +$("dfloodSecs").value) : startDurableFlood(+$("dfloodRate").value, +$("dfloodSecs").value);
+$("dfloodReset").onclick = () => { for (const k of Object.keys(audit.senders)) delete audit.senders[k]; Object.assign(audit, { got: 0, dupCopies: 0, replayDup: 0, replayed: 0, sent: 0, acked: 0 }); };
 
 // ---------- chaos ----------
 $("drainBtn").onclick = () => conn.send("GracefulShutdown");

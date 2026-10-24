@@ -10,7 +10,7 @@ public record ServerInfo(string Name, int Connections, int VirtualConnections, d
 /// Every server publishes a heartbeat into a Redis hash. The live server with the lowest name
 /// (a cheap leader election) aggregates the hash plus the client roster and pushes it to all clients once a second.
 /// </summary>
-public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> hub, ILogger<ClusterReporter> log) : BackgroundService
+public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> hub, ChatLog chatLog, ILogger<ClusterReporter> log) : BackgroundService
 {
     private static readonly TimeSpan Stale = TimeSpan.FromSeconds(4);
 
@@ -77,6 +77,7 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                     servers = live.OrderBy(s => s.Name, StringComparer.Ordinal),
                     clients,
                     redis = await RedisInfo(),
+                    log = await LogStatus(),
                     rebalance,
                 }, ct);
             }
@@ -118,6 +119,16 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
             var c = JsonSerializer.Deserialize<ClientInfo>((string)e.Value!, JsonSerializerOptions.Web);
             if (c is not null && serverPredicate(c.Server)) await db.HashDeleteAsync(DemoKeys.Clients, e.Name);
         }
+    }
+
+    private (DateTime At, object Value) _logStatus;
+
+    private async Task<object> LogStatus()
+    {
+        if (DateTime.UtcNow - _logStatus.At < TimeSpan.FromSeconds(4) && _logStatus.Value is not null) return _logStatus.Value;
+        var (up, brokers, partitions) = await Task.Run(chatLog.Status);
+        _logStatus = (DateTime.UtcNow, new { enabled = chatLog.Enabled, up, brokers, partitions });
+        return _logStatus.Value;
     }
 
     private async Task<object> RedisInfo()

@@ -22,6 +22,16 @@ networks:
     ipam:
       config: [{ subnet: 172.30.77.0/24 }]
 
+x-redpanda: &redpanda
+  image: redpandadata/redpanda:v25.3.18
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    start_period: 10s
+
 services:
   redis-1:
     <<: *redis-node
@@ -47,13 +57,66 @@ services:
     <<: *sentinel
     command: *sentinel-cmd
 
+  # ---- Replicated message log: 3 Redpanda brokers (Raft). No --mode dev-container: that mode skips fsync. ----
+  redpanda-1:
+    <<: *redpanda
+    command: [redpanda, start, --smp=1, --memory=768M, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
+      --node-id=1, --seeds=redpanda-1:33145, --rpc-addr=redpanda-1:33145, --advertise-rpc-addr=redpanda-1:33145,
+      --kafka-addr=0.0.0.0:9092, --advertise-kafka-addr=redpanda-1:9092]
+    volumes: ["redpanda-1:/var/lib/redpanda/data"]
+    networks: { default: { ipv4_address: 172.30.77.21 } }   # fixed: a restarted broker must come back on the same address
+  redpanda-2:
+    <<: *redpanda
+    command: [redpanda, start, --smp=1, --memory=768M, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
+      --node-id=2, --seeds=redpanda-1:33145, --rpc-addr=redpanda-2:33145, --advertise-rpc-addr=redpanda-2:33145,
+      --kafka-addr=0.0.0.0:9092, --advertise-kafka-addr=redpanda-2:9092]
+    volumes: ["redpanda-2:/var/lib/redpanda/data"]
+    networks: { default: { ipv4_address: 172.30.77.22 } }   # fixed: a restarted broker must come back on the same address
+  redpanda-3:
+    <<: *redpanda
+    command: [redpanda, start, --smp=1, --memory=768M, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
+      --node-id=3, --seeds=redpanda-1:33145, --rpc-addr=redpanda-3:33145, --advertise-rpc-addr=redpanda-3:33145,
+      --kafka-addr=0.0.0.0:9092, --advertise-kafka-addr=redpanda-3:9092]
+    volumes: ["redpanda-3:/var/lib/redpanda/data"]
+    networks: { default: { ipv4_address: 172.30.77.23 } }   # fixed: a restarted broker must come back on the same address
+
+  redpanda-init:         # idempotent: creates the topic once, then exits
+    image: redpandadata/redpanda:v25.3.18
+    restart: "no"
+    depends_on:
+      redpanda-1: { condition: service_healthy }
+      redpanda-2: { condition: service_healthy }
+      redpanda-3: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        rpk topic describe chat.messages -X brokers=redpanda-1:9092 >/dev/null 2>&1 ||
+        rpk topic create chat.messages -X brokers=redpanda-1:9092,redpanda-2:9092,redpanda-3:9092
+        -p 12 -r 3 -c min.insync.replicas=2 -c retention.ms=86400000 -c segment.bytes=134217728
+
+  redpanda-console:      # http://localhost:8082 : browse brokers, partitions and messages
+    image: redpandadata/console:v2.8.17
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: redpanda-1:9092,redpanda-2:9092,redpanda-3:9092
+    ports: ["8082:8080"]
+    depends_on:
+      redpanda-init: { condition: service_completed_successfully }
+
   server:                # scale with: docker compose up -d --scale server=N
     build: ./src/ChatServer
     environment:
       Redis__Sentinels: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
       Redis__ServiceName: mymaster
+      Kafka__Bootstrap: redpanda-1:9092,redpanda-2:9092,redpanda-3:9092
     volumes: ["./src/ChatServer/devices.json:/app/devices.json:ro"]   # friendly device names, editable live
-    depends_on: [sentinel-1, sentinel-2, sentinel-3, redis-2, redis-3]
+    depends_on:
+      sentinel-1: { condition: service_started }
+      sentinel-2: { condition: service_started }
+      sentinel-3: { condition: service_started }
+      redis-2: { condition: service_healthy }
+      redis-3: { condition: service_healthy }
+      redpanda-init: { condition: service_completed_successfully }
     restart: unless-stopped
     stop_grace_period: 30s   # graceful drain on SIGTERM (docker stop / rolling restart) needs time
     deploy:
@@ -78,3 +141,9 @@ services:
       MSGS_PER_SEC: 5
       DURATION_SEC: 30
     depends_on: [loadbalancer]
+
+# Persistent data lives in volumes created OUTSIDE compose (scripts/volumes.sh), so nothing compose does can delete it.
+volumes:
+  redpanda-1: { external: true, name: signalr-redpanda-1 }
+  redpanda-2: { external: true, name: signalr-redpanda-2 }
+  redpanda-3: { external: true, name: signalr-redpanda-3 }
