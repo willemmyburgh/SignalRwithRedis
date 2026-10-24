@@ -4,7 +4,7 @@ using StackExchange.Redis;
 
 namespace ChatServer;
 
-public record ServerInfo(string Name, int Connections, int VirtualConnections, double CallsPerSec, long Ts);
+public record ServerInfo(string Name, int Connections, int VirtualConnections, double CallsPerSec, long Ts, int Slot);
 
 /// <summary>
 /// Every server publishes a heartbeat into a Redis hash. The live server with the lowest name
@@ -22,6 +22,7 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
         // After a crash/restart this container's old roster entries are orphans.
         await RemoveRosterEntries(db, s => s == me);
 
+        var slot = -1;
         long lastCalls = ServerStats.Invocations;
         var last = DateTime.UtcNow;
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
@@ -34,9 +35,6 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                 var rate = (calls - lastCalls) / (now - last).TotalSeconds;
                 (lastCalls, last) = (calls, now);
 
-                var mine = new ServerInfo(me, ServerStats.Connections, ServerStats.VirtualConnections, Math.Round(rate, 1), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                await db.HashSetAsync(DemoKeys.Servers, me, JsonSerializer.Serialize(mine));
-
                 var live = new List<ServerInfo>();
                 var dead = new List<string>();
                 var cutoff = DateTimeOffset.UtcNow.Subtract(Stale).ToUnixTimeMilliseconds();
@@ -44,8 +42,21 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                 {
                     var info = JsonSerializer.Deserialize<ServerInfo>((string)e.Value!, JsonSerializerOptions.Web);
                     if (info is null || info.Ts < cutoff) dead.Add(e.Name!);
+                    else if (info.Name == me) { if (slot < 0) slot = info.Slot; } // keep my colour across a restart
                     else live.Add(info);
                 }
+
+                // Colour slot: unique per live server, stable while it lives. On a clash the lower name keeps the slot.
+                if (slot < 0 || live.Any(o => o.Slot == slot && string.CompareOrdinal(o.Name, me) < 0))
+                {
+                    var used = live.Select(o => o.Slot).ToHashSet();
+                    slot = Enumerable.Range(0, int.MaxValue).First(i => !used.Contains(i));
+                }
+
+                var mine = new ServerInfo(me, ServerStats.Connections, ServerStats.VirtualConnections, Math.Round(rate, 1), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), slot);
+                await db.HashSetAsync(DemoKeys.Servers, me, JsonSerializer.Serialize(mine));
+                live.Add(mine);
+
                 var rebalance = (string?)await db.StringGetAsync(DemoKeys.Rebalance) != "0"; // default: on
                 if (rebalance) await ShedExcess(live, mine.Connections);
 

@@ -3,9 +3,19 @@ const short = s => (s || "?").slice(0, 6);
 const state = { id: null, server: null, rooms: new Set(), virtual: [], rx: 0, flood: null, burst: null, reactions: 0 };
 
 // ---------- helpers ----------
-function color(server) { let h = 0; for (const c of server || "?") h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 62% 42%)`; }
+// Each live server owns a colour slot (assigned by the cluster, see ClusterReporter), so colours are distinct and
+// every device shows the same colour for the same server. Chip text also carries the slot number (colour-blind friendly).
+const PALETTE = ["#e6194b", "#3b82f6", "#16a34a", "#f59e0b", "#9333ea", "#0891b2", "#db2777", "#78350f", "#65a30d", "#1e3a8a", "#ea580c", "#475569"];
+const slots = {};
+function slotOf(server) { return slots[server]; }
+function color(server) {
+  const i = slotOf(server);
+  if (i === undefined) return "#8b95a1";
+  return i < PALETTE.length ? PALETTE[i] : `hsl(${(i * 137) % 360} 60% 40%)`;
+}
 function chip(server, text) {
-  const s = document.createElement("span"); s.className = "chip"; s.style.background = color(server); s.textContent = text ?? short(server); return s;
+  const s = document.createElement("span"); s.className = "chip"; s.style.background = color(server);
+  const i = slotOf(server); s.textContent = text ?? `${i === undefined ? "" : "#" + (i + 1) + " "}${short(server)}`; return s;
 }
 function log(msg) {
   const li = document.createElement("li"); li.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
@@ -108,6 +118,8 @@ document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => {
 // ---------- cluster panel ----------
 $("rebal").onchange = () => conn.invoke("SetRebalance", $("rebal").checked);
 conn.on("ClusterStats", s => {
+  for (const k in slots) delete slots[k];
+  s.servers.forEach(x => slots[x.name] = x.slot);
   $("rebal").checked = s.rebalance;
   const total = s.servers.reduce((a, x) => a + x.connections, 0), virt = s.servers.reduce((a, x) => a + x.virtualConnections, 0);
   $("clusterSummary").textContent = `· ${total} connections (${virt} virtual) on ${s.servers.length} servers`;
