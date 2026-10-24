@@ -168,6 +168,16 @@ $("message").onkeydown = e => { if (e.key === "Enter") $("send").click(); };
 // ---------- canvas ----------
 const board = $("board"), g = board.getContext("2d");
 let pen = "#2563eb", drawing = false, last = null, buf = [];
+// On touch screens a full-size drawing surface would swallow every swipe and make the page unscrollable,
+// so drawing there is an explicit mode. Mouse users draw straight away.
+let drawOn = !matchMedia("(pointer: coarse)").matches;
+function applyDrawMode() {
+  board.className = drawOn ? "on" : "off";
+  $("drawMode").className = drawOn ? "" : "off";
+  $("drawMode").textContent = drawOn ? "✏️ Drawing" : "✏️ Draw";
+  $("drawHint").textContent = drawOn ? "Drawing is on: swipes on the canvas paint. Tap “Drawing” to scroll the page again." : "Scrolling is on. Tap “Draw” to paint on the canvas.";
+}
+$("drawMode").onclick = () => { drawOn = !drawOn; applyDrawMode(); };
 for (const c of ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#111111"]) {
   const b = document.createElement("button"); b.style.background = c; b.onclick = () => { pen = c; [...$("colors").children].forEach(x => x.classList.toggle("on", x === b)); };
   if (c === pen) b.classList.add("on"); $("colors").append(b);
@@ -177,7 +187,7 @@ function seg(c, x0, y0, x1, y1) {
   g.moveTo(x0 * board.width, y0 * board.height); g.lineTo(x1 * board.width, y1 * board.height); g.stroke();
 }
 const pos = e => { const r = board.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; };
-board.onpointerdown = e => { drawing = true; last = pos(e); board.setPointerCapture(e.pointerId); };
+board.onpointerdown = e => { if (!drawOn) return; drawing = true; last = pos(e); board.setPointerCapture(e.pointerId); };
 board.onpointerup = board.onpointercancel = () => { drawing = false; };
 board.onpointermove = e => {
   if (!drawing) return; const p = pos(e);
@@ -186,6 +196,7 @@ board.onpointermove = e => {
 setInterval(() => { if (buf.length && conn.state === "Connected") { conn.send("Draw", pen, buf); buf = []; } }, 40);
 conn.on("Draw", (c, s) => { state.rx++; for (let i = 0; i + 3 < s.length; i += 4) seg(c, s[i], s[i + 1], s[i + 2], s[i + 3]); });
 conn.on("ClearCanvas", () => g.clearRect(0, 0, board.width, board.height));
+applyDrawMode();
 $("clear").onclick = () => conn.invoke("ClearCanvas");
 
 // ---------- poll + reactions ----------

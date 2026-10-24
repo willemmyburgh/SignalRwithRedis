@@ -16,8 +16,7 @@ button { background:var(--accent); color:#fff; border:0; cursor:pointer; } butto
 button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
 button.danger { background:var(--danger); }
 .row { display:flex; gap:.5rem; align-items:center; margin-top:.5rem; } .row.wrap { flex-wrap:wrap; } .row input#message { flex:1; min-width:0; }
-nav { display:flex; gap:.3rem; overflow-x:auto; margin-bottom:.5rem; }
-nav button { background:var(--card); color:var(--fg); border:1px solid var(--line); white-space:nowrap; } nav button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+
 #messages { list-style:none; padding:0; margin:.5rem 0; max-height:280px; overflow:auto; }
 #messages li { padding:.25rem 0; border-bottom:1px solid var(--line); word-break:break-word; }
 .chip { display:inline-block; padding:0 .45rem; border-radius:99px; color:#fff; font:.72rem/1.5 ui-monospace,monospace; margin-right:.4rem; }
@@ -41,3 +40,32 @@ code { background:var(--line); padding:0 .25rem; border-radius:3px; }
 .chip { white-space: nowrap; }
 .srvrow { grid-template-columns: 8rem 1fr 8.5rem; }
 .srvrow .chip { justify-self: start; }
+
+/* ---- touch / mobile ---- */
+body { padding-bottom: calc(76px + env(safe-area-inset-bottom)); -webkit-text-size-adjust: 100%; }
+button, select, input, summary { touch-action: manipulation; }
+button, select { min-height: 44px; }
+input, select { font-size: 16px; min-height: 44px; }           /* 16px stops iOS zooming into fields */
+/* bottom tab bar: always reachable with a thumb, no horizontal scrolling */
+nav#tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; display: grid; grid-template-columns: repeat(4, 1fr);
+  background: var(--card); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); }
+nav#tabs button { background: transparent; color: var(--muted); border: 0; border-radius: 0; min-height: 60px; font-size: .78rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+nav#tabs button i { font-style: normal; font-size: 1.4rem; line-height: 1; }
+nav#tabs button.on { color: var(--accent); font-weight: 600; box-shadow: inset 0 3px 0 var(--accent); }
+.row.wrap > * { flex: 0 1 auto; }
+.chips button { min-height: 44px; margin-bottom: .3rem; }
+.pollrow { min-height: 52px; } .pollrow .bar { height: 34px; }
+#emojis { gap: .6rem; } #emojis button { font-size: 1.9rem; min-width: 56px; min-height: 56px; }
+#colors button { width: 2.4rem; height: 2.4rem; min-height: 0; margin-right: .3rem; }
+#board { max-height: 60vh; }
+#board.off { touch-action: pan-y; opacity: .85; }
+#board.on { touch-action: none; }
+#drawMode.off { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+#messages { max-height: 40vh; }
+@media (max-width: 520px) {
+  .card { padding: .7rem .6rem; }
+  .card .row.wrap label { flex: 1 1 100%; display: flex; justify-content: space-between; align-items: center; gap: .6rem; }
+  .card .row.wrap label select { flex: 1; }
+  .card .row.wrap button { flex: 1 1 40%; }
+  .srvrow { grid-template-columns: 7rem 1fr; } .srvrow > span:last-child { grid-column: 1 / -1; margin-top: -.15rem; }
+}

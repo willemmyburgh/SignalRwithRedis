@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>SignalR + Redis scale-out lab</title>
   <link rel="stylesheet" href="style.css" />
   <script src="lib/signalr.min.js"></script>
@@ -37,10 +37,10 @@
 </section>
 
 <nav id="tabs">
-  <button data-tab="chat" class="on">💬 Chat</button>
-  <button data-tab="draw">🎨 Canvas</button>
-  <button data-tab="poll">📊 Poll &amp; React</button>
-  <button data-tab="lab">🧪 Experiments</button>
+  <button data-tab="chat" class="on"><i>💬</i>Chat</button>
+  <button data-tab="draw"><i>🎨</i>Canvas</button>
+  <button data-tab="poll"><i>📊</i>Poll</button>
+  <button data-tab="lab"><i>🧪</i>Lab</button>
 </nav>
 
 <section class="tab card" id="tab-chat">
@@ -53,7 +53,8 @@
 <section class="tab card" id="tab-draw" hidden>
   <p class="hint"><b>What it shows:</b> real-time fan-out of pointer events. Draw here and watch the strokes appear on every other device. (Late joiners see only new strokes: the backplane relays messages, it doesn't store them.)</p>
   <canvas id="board" width="800" height="600"></canvas>
-  <div class="row"><span id="colors"></span><button id="clear" class="ghost">Clear for everyone</button></div>
+  <div class="row wrap"><button id="drawMode">✏️ Draw</button><span id="colors"></span><button id="clear" class="ghost">Clear for all</button></div>
+  <p class="muted" id="drawHint"></p>
 </section>
 
 <section class="tab card" id="tab-poll" hidden>
