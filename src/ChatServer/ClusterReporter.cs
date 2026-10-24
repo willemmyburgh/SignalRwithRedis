@@ -4,7 +4,7 @@ using StackExchange.Redis;
 
 namespace ChatServer;
 
-public record ServerInfo(string Name, int Connections, int VirtualConnections, double CallsPerSec, long Ts, int Slot);
+public record ServerInfo(string Name, int Connections, int VirtualConnections, double CallsPerSec, long Ts, int Slot, bool Draining = false);
 
 /// <summary>
 /// Every server publishes a heartbeat into a Redis hash. The live server with the lowest name
@@ -53,12 +53,12 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                     slot = Enumerable.Range(0, int.MaxValue).First(i => !used.Contains(i));
                 }
 
-                var mine = new ServerInfo(me, ServerStats.Connections, ServerStats.VirtualConnections, Math.Round(rate, 1), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), slot);
-                await db.HashSetAsync(DemoKeys.Servers, me, JsonSerializer.Serialize(mine));
+                var mine = new ServerInfo(me, ServerStats.Connections, ServerStats.VirtualConnections, Math.Round(rate, 1), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), slot, ServerStats.Draining);
+                if (!ServerStats.Stopped) await db.HashSetAsync(DemoKeys.Servers, me, JsonSerializer.Serialize(mine));
                 live.Add(mine);
 
                 var rebalance = (string?)await db.StringGetAsync(DemoKeys.Rebalance) != "0"; // default: on
-                if (rebalance) await ShedExcess(live, mine.Connections);
+                if (rebalance && !ServerStats.Draining) await ShedExcess(live.Where(x => !x.Draining).ToList(), mine.Connections);
 
                 if (live.MinBy(s => s.Name, StringComparer.Ordinal)?.Name != me) continue; // not the leader
 
@@ -122,14 +122,24 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
 
     private async Task<object> RedisInfo()
     {
-        var info = (await redis.GetServers()[0].InfoAsync()).SelectMany(g => g).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
-        string Get(string k) => info.TryGetValue(k, out var v) ? v : "0";
-        return new
+        try
         {
-            opsPerSec = double.Parse(Get("instantaneous_ops_per_sec")),
-            connectedClients = int.Parse(Get("connected_clients")),
-            memory = Get("used_memory_human"),
-            version = Get("redis_version"),
-        };
+            // The multiplexer follows the primary (through Sentinel when configured); find it and read its INFO.
+            var server = redis.GetEndPoints().Select(ep => redis.GetServer(ep)).FirstOrDefault(sv => sv.IsConnected && !sv.IsReplica)
+                         ?? throw new InvalidOperationException("no primary");
+            var info = (await server.InfoAsync()).SelectMany(g => g).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+            string Get(string k) => info.TryGetValue(k, out var v) ? v : "0";
+            return new
+            {
+                up = true,
+                primary = server.EndPoint.ToString(),
+                replicas = int.Parse(Get("connected_slaves")),
+                opsPerSec = double.Parse(Get("instantaneous_ops_per_sec")),
+                connectedClients = int.Parse(Get("connected_clients")),
+                memory = Get("used_memory_human"),
+                version = Get("redis_version"),
+            };
+        }
+        catch { return new { up = false }; }
     }
 }

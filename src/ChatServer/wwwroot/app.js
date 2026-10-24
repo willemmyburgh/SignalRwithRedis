@@ -24,10 +24,10 @@ function log(msg) {
 const retryPolicy = { nextRetryDelayInMilliseconds: c => Math.min(500 + c.previousRetryCount * 500, 5000) }; // never give up
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Server-requested rebalance: drop the socket and reconnect; the load balancer picks the emptiest server.
-async function bounce(c) {
+async function bounce(c, reason) {
   await sleep(Math.random() * 1500); // jitter so a batch doesn't reconnect in lockstep
   if (c._closed) return;
-  if (c === conn) { disconnectedAt = performance.now(); lostServer = state.server; rebalancing = true; }
+  if (c === conn) { disconnectedAt = performance.now(); lostServer = state.server; rebalancing = reason === "drain" ? "drain" : "rebalance"; }
   try { await c.stop(); } catch { /* ignore */ }
   while (!c._closed) { try { await c.start(); return; } catch { await sleep(1500); } }
 }
@@ -38,7 +38,8 @@ function build(url, quiet) {
     .withAutomaticReconnect(retryPolicy)
     .configureLogging(quiet ? signalR.LogLevel.None : signalR.LogLevel.Warning)
     .build();
-  c.on("Reconnect", () => bounce(c));
+  c.on("Reconnect", reason => bounce(c, reason));
+  c.keepAliveIntervalInMilliseconds = 5000; c.serverTimeoutInMilliseconds = 15000; // notice dead servers sooner
   return c;
 }
 const pct = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(p * arr.length))] : NaN;
@@ -66,20 +67,23 @@ const { device, browser } = deviceInfo();
 const nameQuery = name ? `name=${encodeURIComponent(name)}` : `auto=1&device=${encodeURIComponent(device)}&browser=${encodeURIComponent(browser)}`;
 $("name").value = name || `${device} · ${browser}`;
 const conn = build(`/chat?${nameQuery}&cid=${cid}`);
-let disconnectedAt = 0, lostServer = null, rebalancing = false;
+let disconnectedAt = 0, lostServer = null, rebalancing = "";
 
 function setStatus(text, cls) { $("status").textContent = text; $("status").className = "pill " + (cls || ""); }
 
-conn.on("Connected", async (server, id) => {
+let myBuild = 0;
+conn.on("Connected", async (server, id, build) => {
+  // A server from a newer deployment: reload to pick up the new page (never reload for older/equal, so rolling upgrades can't loop).
+  if (!myBuild) myBuild = build; else if (build > myBuild) { log("new version deployed, reloading…"); setTimeout(() => location.reload(), 500); }
   state.id = id; state.server = server;
   $("myServer").replaceChildren("on ", chip(server));
   setStatus("connected", "ok");
   if (disconnectedAt) {
     const secs = ((performance.now() - disconnectedAt) / 1000).toFixed(1);
-    log(rebalancing ? `rebalanced: moved ${short(lostServer)} → ${short(server)} in ${secs}s` : `reconnected to ${short(server)} after ${secs}s (was on ${short(lostServer)})`);
-    disconnectedAt = 0; rebalancing = false;
+    log(rebalancing ? `${rebalancing === "drain" ? "server draining" : "rebalanced"}: moved ${short(lostServer)} → ${short(server)} in ${secs}s` : `reconnected to ${short(server)} after ${secs}s (was on ${short(lostServer)})`);
+    disconnectedAt = 0; rebalancing = "";
   }
-  for (const r of state.rooms) await conn.invoke("JoinRoom", r); // groups are per-connection: re-join
+  for (const r of [...state.rooms, ...(state.flood?.temp || [])]) await conn.invoke("JoinRoom", r); // groups are per-connection: re-join
 });
 conn.onreconnecting(() => { disconnectedAt = performance.now(); lostServer = state.server; setStatus("reconnecting…", ""); log(`lost connection to ${short(state.server)}, retrying…`); });
 conn.onclose(() => { setStatus("disconnected", "bad"); });
@@ -128,10 +132,10 @@ conn.on("ClusterStats", s => {
     const row = document.createElement("div"); row.className = "srvrow" + (x.name === state.server ? " mine" : "");
     const bar = document.createElement("div"); bar.className = "bar"; const i = document.createElement("i");
     i.style.width = (100 * x.connections / max) + "%"; i.style.background = color(x.name); bar.append(i);
-    const txt = document.createElement("span"); txt.textContent = `${x.connections} conn · ${x.callsPerSec}/s`;
+    const txt = document.createElement("span"); txt.textContent = `${x.draining ? "🔧 draining · " : ""}${x.connections} conn · ${x.callsPerSec}/s`;
     row.append(chip(x.name), bar, txt); return row;
   }));
-  $("redisLine").textContent = `Redis ${s.redis.version}: ${s.redis.opsPerSec} ops/s · ${s.redis.connectedClients} connections (one per server) · ${s.redis.memory}`;
+  $("redisLine").textContent = s.redis.up ? `Redis ${s.redis.version} primary ${s.redis.primary} (${s.redis.replicas} replicas): ${s.redis.opsPerSec} ops/s · ${s.redis.connectedClients} connections · ${s.redis.memory}` : "Redis: no primary reachable (failing over?)";
   $("clientsSummary").textContent = `Clients online (${s.clients.length})`;
   $("clients").replaceChildren(...s.clients.map(c => chip(c.server, c.name)));
 });
@@ -141,8 +145,11 @@ conn.on("Notice", t => { log(t); });
 function addMsg(user, text, server, room) {
   state.rx++;
   const li = document.createElement("li");
-  li.append(chip(server)); if (room) { const r = chip("", "room " + room); r.classList.add("room"); r.style.background = ""; li.append(r); }
-  li.append(`${user}: ${text}`); $("messages").prepend(li);
+  if (user === name) li.className = "mine";
+  const aud = document.createElement("span"); aud.className = "aud" + (room ? " room" : "");
+  aud.textContent = room ? `🔒 Room ${room} only` : "👥 Everyone";
+  const who = document.createElement("span"); who.className = "who"; who.textContent = user;
+  li.append(chip(server), aud, who, `: ${text}`); $("messages").prepend(li);
   while ($("messages").children.length > 100) $("messages").lastChild.remove();
 }
 conn.on("ReceiveMessage", (u, m, s) => addMsg(u, m, s));
@@ -154,7 +161,8 @@ for (const r of ["A", "B", "C"]) {
     await conn.invoke(joined ? "JoinRoom" : "LeaveRoom", r);
     joined ? state.rooms.add(r) : state.rooms.delete(r);
     b.classList.toggle("on", joined);
-    $("sendTo").replaceChildren(new Option("Everyone", ""), ...[...state.rooms].sort().map(x => new Option("Room " + x, x)));
+    $("sendTo").replaceChildren(new Option("👥 Everyone", ""), ...[...state.rooms].sort().map(x => new Option("🔒 Room " + x, x)));
+    if (joined) $("sendTo").value = r; // joining a room switches the composer to it
   };
 }
 $("send").onclick = async () => {
@@ -236,11 +244,13 @@ $("pingBtn").onclick = async () => {
 // ---------- experiments: server burst ----------
 const reports = {};
 $("burstBtn").onclick = async () => {
-  const r = await conn.invoke("StartBurst", +$("burstCount").value, +$("burstSize").value, +$("burstRate").value);
+  const r = await conn.invoke("StartBurst", +$("burstCount").value, +$("burstSize").value, +$("burstRate").value, $("burstAudience").value);
   if (r === "busy") log("a burst is already running on this server");
 };
-conn.on("BurstStart", (id, count, server, by, bytes) => {
-  state.burst = { id, expected: count, got: 0, last: 0, ooo: 0, first: 0, lastAt: 0 };
+conn.on("BurstStart", async (id, count, server, by, bytes, audience) => {
+  state.burst = { id, expected: count, got: 0, last: 0, ooo: 0, first: 0, lastAt: 0, audience, autoRoom: null };
+  // Room audiences only reach members: a device in no room joins one for the duration of the burst.
+  if (audience && state.rooms.size === 0) { const r = "ABC"[Math.floor(Math.random() * 3)]; state.burst.autoRoom = r; await conn.invoke("JoinRoom", r); }
   $("burstLive").textContent = `Burst ${id}: ${count} × ${bytes}B from ${short(server)}, started by ${by}…`;
   log(`burst ${id} started by ${by} on ${short(server)} (${count} msgs)`);
 });
@@ -250,8 +260,14 @@ conn.on("BurstMsg", (id, seq) => {
   if (seq < b.last) b.ooo++; b.last = Math.max(b.last, seq);
   if (b.got % 50 === 0) $("burstLive").textContent = `Burst ${id}: received ${b.got}/${b.expected}`;
 });
-conn.on("BurstEnd", (id) => setTimeout(() => {
+conn.on("BurstEnd", (id, count, ms, perRoom) => setTimeout(() => {
   const b = state.burst; if (!b || b.id !== id) return;
+  if (b.audience) {
+    const mine = b.autoRoom ? new Set([b.autoRoom]) : state.rooms;
+    b.expected = [...mine].reduce((n, r) => n + (perRoom?.[r] || 0), 0);
+    if (b.autoRoom) conn.invoke("LeaveRoom", b.autoRoom);
+    if (!b.expected) { $("burstLive").textContent = `Burst ${id}: none of your rooms were addressed`; return; }
+  }
   const ms = Math.max(1, b.lastAt - b.first);
   $("burstLive").textContent = `Burst ${id} done: ${b.got}/${b.expected} received (${(100 * b.got / b.expected).toFixed(1)}%)`;
   conn.send("ReportBurst", id, b.got, b.expected, Math.round(ms), b.ooo);
@@ -267,17 +283,30 @@ conn.on("BurstReport", (who, server, id, got, expected, ms, ooo) => {
 });
 
 // ---------- experiments: flood ----------
-function startFlood(rate, secs) {
+async function startFlood(rate, secs, audience = "everyone") {
   stopFlood();
-  const f = state.flood = { sent: 0, got: 0, lat: [], bySrv: {}, timer: null, until: performance.now() + secs * 1000 };
+  const f = state.flood = { sent: 0, got: 0, lat: [], bySrv: {}, timer: null, until: performance.now() + secs * 1000, audience, temp: [] };
+  if (audience !== "everyone") {
+    // join two random rooms for the test (rooms the user already joined are kept as they are)
+    for (const r of ["A", "B", "C"].sort(() => Math.random() - .5).slice(0, 2)) if (!state.rooms.has(r)) { f.temp.push(r); await conn.invoke("JoinRoom", r); }
+  }
   const per = Math.max(1, Math.round(rate / 10));
   f.timer = setInterval(() => {
     if (performance.now() > f.until || conn.state !== "Connected") return stopFlood(true);
-    for (let i = 0; i < per; i++) { conn.send("Noise", state.id, performance.now()); f.sent++; }
+    for (let i = 0; i < per; i++) {
+      const toRoom = f.audience === "rooms" || (f.audience === "mixed" && Math.random() < .5);
+      if (toRoom) conn.send("NoiseToRoom", "ABC"[Math.floor(Math.random() * 3)], state.id, performance.now());
+      else conn.send("Noise", state.id, performance.now());
+      f.sent++;
+    }
   }, 1000 / (rate / per));
-  log(`flood started: ${rate}/s for ${secs}s`);
+  log(`flood started: ${rate}/s for ${secs}s, audience ${audience}`);
 }
-function stopFlood(done) { if (state.flood?.timer) { clearInterval(state.flood.timer); state.flood.timer = null; if (done) log("flood finished"); } }
+function stopFlood(done) {
+  const f = state.flood; if (!f?.timer) return;
+  clearInterval(f.timer); f.timer = null; if (done) log("flood finished");
+  for (const r of f.temp) conn.invoke("LeaveRoom", r).catch(() => {}); f.temp = [];
+}
 conn.on("Noise", (from, server, t) => {
   state.rx++; const f = state.flood; if (!f) return; f.got++;
   if (from === state.id) { f.lat.push(performance.now() - t); if (f.lat.length > 3000) f.lat.shift(); }
@@ -305,17 +334,19 @@ document.querySelectorAll(".vu").forEach(b => b.onclick = () => $("onAll").check
 $("vuStop").onclick = () => closeVirtual();
 
 // ---------- remote commands ----------
-$("floodBtn").onclick = () => $("onAll").checked ? conn.invoke("RunOnAll", "flood", +$("floodRate").value, +$("floodSecs").value) : startFlood(+$("floodRate").value, +$("floodSecs").value);
+$("floodBtn").onclick = () => $("onAll").checked ? conn.invoke("RunOnAll", "flood", +$("floodRate").value, +$("floodSecs").value, $("floodAudience").value) : startFlood(+$("floodRate").value, +$("floodSecs").value, $("floodAudience").value);
 $("stopAll").onclick = () => conn.invoke("RunOnAll", "stop", 0, 0);
-conn.on("Command", (cmd, a, b, by) => {
+conn.on("Command", (cmd, a, b, by, arg) => {
   if (!$("accept").checked) return;
   log(`command from ${by}: ${cmd} ${a || ""} ${b || ""}`);
   if (cmd === "virtual") addVirtual(a);
-  else if (cmd === "flood") startFlood(a, b);
+  else if (cmd === "flood") startFlood(a, b, arg || "everyone");
   else if (cmd === "stop") { stopFlood(true); closeVirtual(); }
 });
 
 // ---------- chaos ----------
+$("drainBtn").onclick = () => conn.send("GracefulShutdown");
+$("redisBtn").onclick = async () => log("redis: " + await conn.invoke("FailoverRedis"));
 $("crashBtn").onclick = () => { if (confirm("Crash the server you are connected to?")) conn.send("CrashServer"); };
 
 start();

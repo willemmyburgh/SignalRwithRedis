@@ -11,6 +11,7 @@
 <body>
 <div id="fx"></div>
 
+<div id="top">
 <header>
   <div class="top">
     <h1>SignalR × Redis <small>scale-out lab</small></h1>
@@ -21,7 +22,7 @@
     <span id="myServer" class="muted">–</span>
     <span class="muted">RTT <b id="rtt">–</b></span>
     <span class="muted">↓ <b id="rx">0</b>/s</span>
-    <label class="muted"><input type="checkbox" id="accept" checked /> accept remote commands</label>
+    <label class="muted"><input type="checkbox" id="accept" checked /> accept remote cmds</label>
     <button id="inviteBtn" class="ghost">Invite devices</button>
   </div>
   <div id="invite" hidden><canvas id="qr"></canvas><div><b id="inviteUrl"></b><p class="muted">Scan or type this on any phone/computer on the same network.</p></div></div>
@@ -29,25 +30,24 @@
 
 <section class="card" id="cluster">
   <h2>Cluster <span class="muted" id="clusterSummary"></span></h2>
+  <label class="muted rebal"><input type="checkbox" id="rebal" checked /> Auto-rebalance</label>
   <div id="servers"></div>
-  <label class="muted"><input type="checkbox" id="rebal" checked /> Auto-rebalance connections</label>
   <div id="redisLine" class="muted"></div>
   <details><summary id="clientsSummary">Clients online</summary><div id="clients"></div></details>
-  <p class="hint">Every colour is one server instance behind the load balancer. This panel is pushed to every client once a second, regardless of which server it is attached to. With auto-rebalance on, servers holding more than their share ask some clients to reconnect, and the load balancer (least-connections) sends them to the emptiest server. Try: crash a server (Experiments), or <code>--scale server=6</code>, and watch the bars even out. Untick it to see connections stay skewed.</p>
+  <details><summary>About this panel</summary><p class="hint">Every colour is one server instance behind the load balancer. This panel is pushed to every client once a second, regardless of which server it is attached to. With auto-rebalance on, servers holding more than their share ask some clients to reconnect, and the load balancer (least-connections) sends them to the emptiest server. Try: crash a server (Experiments), or <code>--scale server=6</code>, and watch the bars even out. Untick it to see connections stay skewed.</p></details>
 </section>
+</div>
 
-<nav id="tabs">
-  <button data-tab="chat" class="on"><i>💬</i>Chat</button>
-  <button data-tab="draw"><i>🎨</i>Canvas</button>
-  <button data-tab="poll"><i>📊</i>Poll</button>
-  <button data-tab="lab"><i>🧪</i>Lab</button>
-</nav>
+<main id="content">
+
 
 <section class="tab card" id="tab-chat">
   <p class="hint"><b>What it shows:</b> <code>Clients.All</code> and <code>Clients.Group</code> reach every device on every server. The tag on each message is the server that handled the <i>sender's</i> call. Join rooms to see targeted delivery: messages to a room only reach its members.</p>
-  <div class="chips" id="rooms"></div>
   <ul id="messages"></ul>
-  <div class="row"><select id="sendTo"><option value="">Everyone</option></select><input id="message" placeholder="Message" /><button id="send">Send</button></div>
+  <div class="composer">
+    <div class="chips"><span class="muted">Listening to <b>Everyone</b> +</span> <span id="rooms"></span></div>
+    <div class="row"><select id="sendTo" aria-label="Send to"><option value="">👥 Everyone</option></select><input id="message" placeholder="Message" /><button id="send">Send</button></div>
+  </div>
 </section>
 
 <section class="tab card" id="tab-draw" hidden>
@@ -82,10 +82,11 @@
 
   <div class="card">
     <h3>2 · Server burst (fan-out + backplane throughput)</h3>
-    <p class="hint">The <i>server you're on</i> publishes N messages to <b>every connected client</b> through Redis. Each device counts what it receives (loss, ordering, msgs/s) and reports back below.</p>
+    <p class="hint">The <i>server you're on</i> publishes N messages to <b>every connected client</b> through Redis. Pick everyone or rooms (devices without a room join one automatically). Each device counts what it receives (loss, ordering, msgs/s) and reports back below.</p>
     <div class="row wrap">
       <label>Messages <select id="burstCount"><option>100</option><option selected>1000</option><option>5000</option><option>20000</option></select></label>
       <label>Payload <select id="burstSize"><option value="0">tiny</option><option value="1024">1 KB</option><option value="8192">8 KB</option></select></label>
+      <label>Audience <select id="burstAudience"><option value="">👥 Everyone</option><option value="*">🎲 Random room per message</option><option value="A">🔒 Room A</option><option value="B">🔒 Room B</option><option value="C">🔒 Room C</option></select></label>
       <label>Rate <select id="burstRate"><option value="0">max</option><option value="100">100/s</option><option value="500" selected>500/s</option><option value="2000">2000/s</option></select></label>
       <button id="burstBtn">Run burst</button>
     </div>
@@ -95,8 +96,9 @@
 
   <div class="card">
     <h3>3 · Flood (many senders → many receivers)</h3>
-    <p class="hint">Each device sends tiny messages to everyone at the chosen rate. Total deliveries/s = devices × rate × connections. Each device times its <i>own</i> messages coming back through Redis (end-to-end latency).</p>
+    <p class="hint">Each device sends tiny messages at the chosen rate, to everyone and/or to random rooms (devices join two random rooms A–C for the test, so room traffic only reaches members). Total deliveries/s = devices × rate × connections. Each device times its <i>own</i> messages coming back through Redis (end-to-end latency).</p>
     <div class="row wrap">
+      <label>Audience <select id="floodAudience"><option value="everyone">👥 Everyone</option><option value="rooms">🎲 Random rooms</option><option value="mixed">🎲 Mixed (half Everyone)</option></select></label>
       <label>Per device <select id="floodRate"><option value="5">5/s</option><option value="20" selected>20/s</option><option value="50">50/s</option></select></label>
       <label>For <select id="floodSecs"><option>10</option><option selected>20</option><option>60</option></select> s</label>
       <button id="floodBtn">Start flood</button>
@@ -115,13 +117,28 @@
   </div>
 
   <div class="card">
-    <h3>5 · Chaos: crash a server</h3>
-    <p class="hint">Kills the instance this device is connected to. Docker restarts it; all its clients reconnect to the survivors and re-join their rooms. Watch the cluster panel and the event log. Messages sent in the gap are lost (SignalR + Redis is at-most-once).</p>
-    <button id="crashBtn" class="danger">💥 Crash my server</button>
+    <h3>5 · Resilience</h3>
+    <p class="hint"><b>Abrupt:</b> kills the instance you're on with no warning (like a power cut). Its clients notice, reconnect to the survivors and re-join their rooms; messages sent in the gap are lost.<br>
+    <b>Graceful:</b> the instance leaves the load balancer, asks its clients to move in small waves, and only then exits (what a rolling upgrade does). Compare the "moved … in Ns" lines in the log.<br>
+    <b>Redis failover:</b> Sentinel promotes a replica to primary. The app keeps serving; the Redis line in the cluster panel shows the new primary. (Try <code>docker compose stop redis-1</code> too.)</p>
+    <div class="row wrap">
+      <button id="crashBtn" class="danger">💥 Crash my server</button>
+      <button id="drainBtn">🛑 Gracefully shut down my server</button>
+      <button id="redisBtn" class="ghost">🔁 Redis failover</button>
+    </div>
   </div>
 
   <div class="card"><h3>Event log</h3><ul id="log"></ul></div>
 </section>
+
+</main>
+
+<nav id="tabs">
+  <button data-tab="chat" class="on"><i>💬</i>Chat</button>
+  <button data-tab="draw"><i>🎨</i>Canvas</button>
+  <button data-tab="poll"><i>📊</i>Poll</button>
+  <button data-tab="lab"><i>🧪</i>Lab</button>
+</nav>
 
 <script src="app.js"></script>
 </body>

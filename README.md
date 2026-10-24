@@ -44,6 +44,14 @@ WebSockets are long-lived, so after a crash, restart or `--scale` the new/empty 
 
 Browsers can't read a device's real name. Order used: a name you type (saved in the browser) → `src/ChatServer/devices.json` (`{"match": "<regex on User-Agent>", "name": "..."}`, edited live, no restart) → reverse DNS of the client address (only works when the real client IP reaches the server, which Docker Desktop hides) → browser-reported device + browser, e.g. `iPhone · Safari`. Duplicates are numbered (`Mac · Chrome`, `Mac · Chrome #2`; a different browser gets its own name). Edit `devices.json` with a tool that keeps the file inode (e.g. `cat >`), or restart the servers, because it is bind-mounted.
 
+## High availability and graceful shutdown
+
+- **Redis**: 1 primary + 2 replicas + 3 Sentinels (quorum 2); the app connects through the Sentinels and follows failovers. Try `docker compose stop redis-1` (or the *Redis failover* button in Lab → Resilience; or `docker exec <sentinel> redis-cli -p 26379 sentinel failover mymaster`). Nodes have fixed IPs and are referenced by IP everywhere, and the backplane connection demands the primary for pub/sub: otherwise StackExchange.Redis can hold subscriptions on two nodes and every message is delivered twice after a failover (seen and fixed, see `RedisHa.cs`). Five consecutive failovers under load: 98-100% delivered, no duplicates. Messages published during the few seconds of election are lost (pub/sub is at-most-once); the demo's poll/roster state survives via replication.
+- **Graceful shutdown** (`docker stop`, `docker restart`, rolling upgrades, or the Lab button): on SIGTERM the instance fails `/healthz` (HAProxy stops sending it new connections within ~2 s), waits 3 s, asks its clients to reconnect in 10 waves, waits until they are gone (max ~14 s), then exits. `stop_grace_period: 30s`. The drain runs in `ApplicationStopping`, because Kestrel stops before hosted services in minimal hosting and would otherwise cut the sockets first. Clients that are moved this way lose the messages published while their socket is being swapped (typically a fraction of a second), so it is *mostly* seamless, not lossless. A make-before-break client (second socket first) would close that gap.
+- **Abrupt crash** (`docker kill`, power loss): clients detect it within ~15 s at worst (usually instantly via TCP reset), reconnect with back-off, and re-join rooms.
+- Rolling restart: `for s in $(docker compose ps -q server); do docker restart $s; sleep 20; done`.
+- Open pages reload themselves when they reconnect to a newer deployment.
+
 ## Scale horizontally
 
 ```bash
@@ -55,7 +63,7 @@ curl localhost:9000/stats           # repeat – responses come from different i
 
 ```bash
 docker compose run --rm loadtest
-# tune: CONNECTIONS=2000 SENDERS=10 MSGS_PER_SEC=5 DURATION_SEC=60
+# tune: CONNECTIONS=2000 SENDERS=10 MSGS_PER_SEC=5 DURATION_SEC=60 AUDIENCE=everyone|rooms|mixed ROOMS=3
 docker compose run --rm -e CONNECTIONS=2000 -e SENDERS=10 loadtest
 ```
 

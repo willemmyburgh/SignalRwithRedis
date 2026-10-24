@@ -1,21 +1,61 @@
+# Redis high availability: 1 primary + 2 replicas, supervised by 3 Sentinels (quorum 2).
+# Sentinels elect a new primary if the current one dies; the app discovers the primary through the Sentinels.
+# The Redis nodes have FIXED IPs and are referred to by IP everywhere (Sentinel, replicaof): StackExchange.Redis treats
+# "redis-1:6379" and "172.x.x.x:6379" as two different servers, which makes the backplane deliver every message twice.
+x-redis-node: &redis-node
+  image: redis:7-alpine
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 3s
+    timeout: 2s
+    retries: 10
+  restart: unless-stopped
+
+x-sentinel: &sentinel
+  image: redis:7-alpine
+  restart: unless-stopped
+  depends_on:
+    redis-1: { condition: service_healthy }
+
+networks:
+  default:
+    ipam:
+      config: [{ subnet: 172.30.77.0/24 }]
+
 services:
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
-      timeout: 2s
-      retries: 10
+  redis-1:
+    <<: *redis-node
+    command: ["redis-server", "--appendonly", "no"]
+    networks: { default: { ipv4_address: 172.30.77.11 } }
+  redis-2:
+    <<: *redis-node
+    command: ["redis-server", "--appendonly", "no", "--replicaof", "172.30.77.11", "6379"]
+    networks: { default: { ipv4_address: 172.30.77.12 } }
+  redis-3:
+    <<: *redis-node
+    command: ["redis-server", "--appendonly", "no", "--replicaof", "172.30.77.11", "6379"]
+    networks: { default: { ipv4_address: 172.30.77.13 } }
+
+  sentinel-1:
+    <<: *sentinel
+    command: &sentinel-cmd >
+      sh -c 'printf "port 26379\nsentinel resolve-hostnames yes\nsentinel monitor mymaster 172.30.77.11 6379 2\nsentinel down-after-milliseconds mymaster 3000\nsentinel failover-timeout mymaster 10000\nsentinel parallel-syncs mymaster 1\n" > /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf'
+  sentinel-2:
+    <<: *sentinel
+    command: *sentinel-cmd
+  sentinel-3:
+    <<: *sentinel
+    command: *sentinel-cmd
 
   server:                # scale with: docker compose up -d --scale server=N
     build: ./src/ChatServer
     environment:
-      ConnectionStrings__Redis: redis:6379
+      Redis__Sentinels: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      Redis__ServiceName: mymaster
     volumes: ["./src/ChatServer/devices.json:/app/devices.json:ro"]   # friendly device names, editable live
-    depends_on:
-      redis: { condition: service_healthy }
+    depends_on: [sentinel-1, sentinel-2, sentinel-3, redis-2, redis-3]
     restart: unless-stopped
+    stop_grace_period: 30s   # graceful drain on SIGTERM (docker stop / rolling restart) needs time
     deploy:
       replicas: 3
 
@@ -25,7 +65,7 @@ services:
     volumes: ["./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
     depends_on: [server]
 
-  loadtest:              # run on demand: docker compose run --rm loadtest
+  loadtest:              # run on demand: docker compose run --no-deps --rm loadtest
     build: ./src/LoadTest
     profiles: ["loadtest"]
     environment:

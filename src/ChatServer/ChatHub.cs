@@ -7,12 +7,15 @@ namespace ChatServer;
 
 public record ClientInfo(string Name, string Server, string Cid = "");
 
-public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubContext) : Hub
+public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubContext, IHostApplicationLifetime lifetime, RedisHa redisHa) : Hub
 {
     public static string ServerName { get; } = Environment.MachineName;
+    // Lets open pages notice a newer deployment and reload themselves (see app.js).
+    public static long BuildStamp { get; } = new DateTimeOffset(File.GetLastWriteTimeUtc(typeof(ChatHub).Assembly.Location)).ToUnixTimeSeconds();
     public const int PollOptions = 4;
 
     private static int _burstRunning;
+    private static readonly string[] Rooms = ["A", "B", "C"];
     private IDatabase Db => redis.GetDatabase();
     private string Name => Context.Items["name"] as string ?? "?";
     private bool IsVirtual => Context.Items["virtual"] is true;
@@ -39,12 +42,14 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
             }
             else wanted = query["name"].ToString().Trim();
             if (wanted.Length == 0) wanted = "Device";
-            Context.Items["name"] = await UniqueName(Clean(wanted, 24));
-            await RegisterClient();
+            // Redis-backed extras are best effort: connections must keep working while Redis fails over.
+            try { Context.Items["name"] = await UniqueName(Clean(wanted, 24)); } catch { Context.Items["name"] = Clean(wanted, 24); }
+            try { await RegisterClient(); } catch { /* roster entry missing until reconnect */ }
             await Clients.Caller.SendAsync("YourName", Name);
-            await Clients.Caller.SendAsync("PollUpdate", await GetPoll());
+            try { await Clients.Caller.SendAsync("PollUpdate", await GetPoll()); } catch { /* poll unavailable */ }
         }
-        await Clients.Caller.SendAsync("Connected", ServerName, Context.ConnectionId);
+        await Clients.Caller.SendAsync("Connected", ServerName, Context.ConnectionId, BuildStamp);
+        if (ServerStats.Draining) await Clients.Caller.SendAsync("Reconnect", "drain"); // landed here during shutdown: move on
         await base.OnConnectedAsync();
     }
 
@@ -52,7 +57,7 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
     {
         ServerStats.ConnectionClosed(IsVirtual);
         ConnectionTracker.Remove(Context.ConnectionId);
-        if (!IsVirtual) await Db.HashDeleteAsync(DemoKeys.Clients, Context.ConnectionId);
+        if (!IsVirtual) { try { await Db.HashDeleteAsync(DemoKeys.Clients, Context.ConnectionId); } catch { /* Redis down */ } }
         await base.OnDisconnectedAsync(exception);
     }
 
@@ -104,8 +109,8 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
     public Task SendMessage(string user, string message, long sentTicks = 0) =>
         Clients.All.SendAsync("ReceiveMessage", user, message, ServerName, sentTicks);
 
-    public Task SendToRoom(string room, string user, string message) =>
-        Clients.Group("room:" + Clean(room, 20)).SendAsync("RoomMessage", user, message, ServerName, room);
+    public Task SendToRoom(string room, string user, string message, long sentTicks = 0) =>
+        Clients.Group("room:" + Clean(room, 20)).SendAsync("RoomMessage", user, message, ServerName, room, sentTicks);
 
     public Task JoinRoom(string room) => Groups.AddToGroupAsync(Context.ConnectionId, "room:" + Clean(room, 20));
     public Task LeaveRoom(string room) => Groups.RemoveFromGroupAsync(Context.ConnectionId, "room:" + Clean(room, 20));
@@ -145,16 +150,18 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
 
     /// <summary>Tiny message used by the "flood" experiment; the sender times its own copy coming back.</summary>
     public Task Noise(string from, double sentAt) => Clients.All.SendAsync("Noise", from, ServerName, sentAt);
+    public Task NoiseToRoom(string room, string from, double sentAt) => Clients.Group("room:" + Clean(room, 20)).SendAsync("Noise", from, ServerName, sentAt);
 
     /// <summary>Ask every device (that opted in) to run a command, e.g. open virtual users.</summary>
-    public Task RunOnAll(string command, int a, int b) => Clients.All.SendAsync("Command", command, a, b, Name);
+    public Task RunOnAll(string command, int a, int b, string arg = "") => Clients.All.SendAsync("Command", command, a, b, Name, arg);
 
     /// <summary>
     /// Server-side burst: THIS server publishes <paramref name="count"/> messages to all clients on all servers.
     /// Clients count what arrives (loss / ordering / throughput) and report back.
     /// </summary>
-    public string StartBurst(int count, int payloadBytes, int ratePerSec)
+    public string StartBurst(int count, int payloadBytes, int ratePerSec, string audience = "")
     {
+        if (audience != "" && audience != "*") audience = Clean(audience, 20);
         count = Math.Clamp(count, 1, 20_000);
         payloadBytes = Math.Clamp(payloadBytes, 0, 16_384);
         ratePerSec = Math.Clamp(ratePerSec, 0, 50_000);
@@ -167,19 +174,28 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
             try
             {
                 var payload = new string('x', payloadBytes);
-                await hubContext.Clients.All.SendAsync("BurstStart", runId, count, ServerName, starter, payloadBytes);
+                var perRoom = new Dictionary<string, int>();
+                await hubContext.Clients.All.SendAsync("BurstStart", runId, count, ServerName, starter, payloadBytes, audience);
                 await Task.Delay(300);
                 var sw = Stopwatch.StartNew();
                 for (var i = 1; i <= count; i++)
                 {
-                    await hubContext.Clients.All.SendAsync("BurstMsg", runId, i, payload);
+                    if (audience == "")
+                        await hubContext.Clients.All.SendAsync("BurstMsg", runId, i, payload);
+                    else
+                    {
+                        // "*" = a random room per message; otherwise a fixed room name.
+                        var room = audience == "*" ? Rooms[Random.Shared.Next(Rooms.Length)] : audience;
+                        perRoom[room] = perRoom.GetValueOrDefault(room) + 1;
+                        await hubContext.Clients.Group("room:" + room).SendAsync("BurstMsg", runId, i, payload);
+                    }
                     if (ratePerSec > 0)
                     {
                         var ahead = TimeSpan.FromSeconds((double)i / ratePerSec) - sw.Elapsed;
                         if (ahead > TimeSpan.FromMilliseconds(5)) await Task.Delay(ahead);
                     }
                 }
-                await hubContext.Clients.All.SendAsync("BurstEnd", runId, count, sw.ElapsedMilliseconds);
+                await hubContext.Clients.All.SendAsync("BurstEnd", runId, count, sw.ElapsedMilliseconds, perRoom);
             }
             finally { Volatile.Write(ref _burstRunning, 0); }
         });
@@ -191,6 +207,21 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
 
     /// <summary>Turn automatic connection rebalancing on/off for the whole cluster.</summary>
     public Task SetRebalance(bool enabled) => Db.StringSetAsync(DemoKeys.Rebalance, enabled ? "1" : "0");
+
+    /// <summary>Graceful: drain this instance (clients are moved away first), then let it exit. Docker restarts it.</summary>
+    public Task GracefulShutdown()
+    {
+        _ = Task.Run(async () => { await Task.Delay(200); lifetime.StopApplication(); });
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Redis HA: ask Sentinel to promote a replica to primary right now.</summary>
+    public async Task<string> FailoverRedis()
+    {
+        var result = await redisHa.FailoverAsync();
+        await Clients.All.SendAsync("Notice", $"🔁 {result} (requested by {Name})");
+        return result;
+    }
 
     /// <summary>Chaos: kill the instance handling this call. Docker restarts it; clients fail over.</summary>
     public async Task CrashServer()
@@ -222,6 +253,7 @@ public static class ServerStats
     private static int _connections, _virtual;
     private static long _invocations;
 
+    public static volatile bool Draining, Stopped;
     public static int Connections => _connections;
     public static int VirtualConnections => _virtual;
     public static long Invocations => Interlocked.Read(ref _invocations);
@@ -251,7 +283,7 @@ public static class ConnectionTracker
     {
         var all = Ids.Keys.ToArray();
         Random.Shared.Shuffle(all);
-        return all.Take(count).ToArray();
+        return count >= all.Length ? all : all.Take(count).ToArray();
     }
 }
 
