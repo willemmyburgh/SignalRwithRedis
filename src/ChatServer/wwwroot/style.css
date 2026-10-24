@@ -38,3 +38,6 @@ table { width:100%; border-collapse:collapse; font-size:.82rem; margin-top:.4rem
 #log { list-style:none; padding:0; margin:0; max-height:260px; overflow:auto; font:.78rem ui-monospace,monospace; } #log li { padding:.1rem 0; }
 #invite { display:flex; gap:1rem; align-items:center; padding:.6rem; } #invite[hidden] { display:none; } #qr { width:140px; height:140px; }
 code { background:var(--line); padding:0 .25rem; border-radius:3px; }
+.chip { white-space: nowrap; }
+.srvrow { grid-template-columns: 8rem 1fr 8.5rem; }
+.srvrow .chip { justify-self: start; }
