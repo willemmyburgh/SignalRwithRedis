@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SignalR + Redis scale-out</title>
+  <script src="lib/signalr.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    .row { display: flex; gap: .5rem; margin-bottom: .5rem; }
+    input { padding: .4rem; } #message { flex: 1; }
+    #me { padding: .5rem; background: #eef; border-radius: 6px; margin-bottom: 1rem; }
+    #messages { list-style: none; padding: 0; }
+    #messages li { padding: .3rem .5rem; border-bottom: 1px solid #eee; }
+    .srv { float: right; color: #888; font: .8rem monospace; }
+    table { border-collapse: collapse; margin-top: 1rem; } td, th { padding: .2rem .8rem; border: 1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <h2>SignalR Redis multi-server demo</h2>
+  <div id="me">Connecting&hellip;</div>
+  <div class="row">
+    <input id="user" placeholder="Name" value="anon" size="10" />
+    <input id="message" placeholder="Message" />
+    <button id="send">Send</button>
+  </div>
+  <ul id="messages"></ul>
+  <h3>Server instances (via load balancer)</h3>
+  <button id="refresh">Sample /stats 10x</button>
+  <table id="stats"></table>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    // WebSockets only + skipNegotiation: the connection never needs sticky sessions,
+    // so any load balancer algorithm works.
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("/chat", { skipNegotiation: true, transport: signalR.HttpTransportType.WebSockets })
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on("Connected", server => $("me").textContent = `Connected to server instance: ${server}`);
+    connection.on("ReceiveMessage", (user, message, server) => {
+      const li = document.createElement("li");
+      li.textContent = `${user}: ${message}`;
+      const s = document.createElement("span"); s.className = "srv"; s.textContent = `via ${server}`;
+      li.prepend(s);
+      $("messages").prepend(li);
+    });
+    connection.onreconnected(() => $("me").textContent += " (reconnected)");
+
+    $("send").onclick = async () => {
+      const msg = $("message").value; if (!msg) return;
+      await connection.invoke("SendMessage", $("user").value, msg, 0);
+      $("message").value = "";
+    };
+    $("message").onkeydown = e => { if (e.key === "Enter") $("send").click(); };
+
+    $("refresh").onclick = async () => {
+      const seen = {};
+      for (let i = 0; i < 10; i++) {
+        const s = await (await fetch("/stats", { cache: "no-store", headers: { Connection: "close" } })).json();
+        seen[s.server] = s;
+      }
+      $("stats").innerHTML = "<tr><th>Server</th><th>WS connections</th><th>Messages sent</th></tr>" +
+        Object.values(seen).map(s => `<tr><td>${s.server}</td><td>${s.connections}</td><td>${s.messagesSent}</td></tr>`).join("");
+    };
+
+    connection.start().catch(e => $("me").textContent = "Failed: " + e);
+  </script>
+</body>
+</html>
