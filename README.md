@@ -10,6 +10,21 @@ Horizontally scaled ASP.NET Core SignalR (.NET 10) behind a YARP gateway. Redis 
                         Sentinel x3 ◄─ "who is primary?" ─ Redis primary ─► replica 1, replica 2   live state + at-most-once path
 ```
 
+## What this proof of concept accomplishes
+
+It answers four practical questions about running real-time .NET services at scale, and lets you check each answer yourself:
+
+1. **Can SignalR run on many servers at once?** Yes. Three (or `--scale server=N`) identical servers share one set of users through a Redis backplane, behind a YARP gateway that spreads the WebSockets.
+2. **What happens when a part dies or is upgraded?** The lab lets you crash a server, drain one gracefully, fail over Redis and stop Redpanda brokers while real clients are connected, and shows what each does to users.
+3. **Can a message be made not to get lost?** The default path (Redis pub/sub) can lose messages, and the lab measures how many. The durable path (Redpanda replicated log plus resume offsets) loses none in every injected failure (audited, 0 missing).
+4. **How do you keep all this runnable by one command?** Everything is Docker Compose: 3 servers, gateway, 3 Redis, 3 Sentinels, 3 Redpanda brokers, console. Data volumes survive `docker compose down -v`.
+
+It is a learning and measurement lab, not a production template: no authentication, one Docker host, Redis not persisted. Documentation map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how it fits together), [docs/USER-MANUAL.md](docs/USER-MANUAL.md) (the web page, tab by tab), and the sections below (measurements and lessons).
+
+## Requirements
+
+Docker Desktop on macOS or Windows (or Docker Engine on Linux) with Compose v2, about 6 GB of RAM for Docker, and ports 9000, 8404 and 8082 free. You do not need the .NET SDK: everything builds inside Docker. On Windows use PowerShell for the commands below (`.\scripts\up.ps1`) or Git Bash/WSL for the `.sh` scripts.
+
 | Path | Used for | Guarantee |
 |---|---|---|
 | Redis pub/sub backplane | the original chat, rooms, canvas, reactions, poll notifications, cluster panel | at most once (lost during failover, crash, socket swap, offline) |
@@ -25,10 +40,11 @@ Horizontally scaled ASP.NET Core SignalR (.NET 10) behind a YARP gateway. Redis 
 ## Run
 
 ```bash
-./scripts/up.sh                     # creates the persistent volumes, then: docker compose up -d --build
-open http://localhost:9000          # open in 2+ tabs; each shows which server it hit
-open http://localhost:8082          # Redpanda Console: brokers, partitions, messages
-open http://localhost:8404          # gateway: destinations, health, open sockets per server
+./scripts/up.sh                     # macOS/Linux/Git Bash. Windows PowerShell: .\scripts\up.ps1
+# then open these in a browser (use two or more tabs on the first one; each shows which server it hit):
+#   http://localhost:9000   the lab page
+#   http://localhost:8082   Redpanda Console: brokers, partitions, messages
+#   http://localhost:8404   gateway: destinations, health, open sockets per server
 ```
 
 The first start takes about a minute (Redpanda forms its cluster, then `redpanda-init` creates the topic, then the servers start). Plain `docker compose up -d` also works once the volumes exist.
@@ -78,7 +94,7 @@ Steady-state cost of the durable path: p50 about 6 to 7 ms from send to delivery
 
 ## Use it from other devices on your LAN
 
-Port 9000 is published on all interfaces. On phones/laptops open `http://willem-macs:9000` (or `http://willem-macs.local:9000`, or the Mac's IP; Android often needs the IP). The **Invite devices** button shows a QR code. If devices can't connect, check the macOS firewall.
+Port 9000 is published on all interfaces. On phones and other computers on the same network open `http://<this-computer's-name-or-IP>:9000`. The IP address always works (macOS: `ipconfig getifaddr en0`; Windows: `ipconfig`); computer names usually work on Apple devices (`name.local`) and often not on Android. The **Invite devices** button in the page shows a QR code with the right address. If devices can't connect, allow Docker Desktop through the firewall (macOS: System Settings > Network > Firewall; Windows: allow Docker Desktop on private networks) and make sure both devices are on the same Wi-Fi without client isolation.
 
 | Tab | Demonstrates |
 |---|---|
