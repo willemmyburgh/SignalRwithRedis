@@ -60,21 +60,21 @@ services:
   # ---- Replicated message log: 3 Redpanda brokers (Raft). No --mode dev-container: that mode skips fsync. ----
   redpanda-1:
     <<: *redpanda
-    command: [redpanda, start, --smp=1, --memory=768M, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
+    command: [redpanda, start, --smp=1, --memory=1G, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
       --node-id=1, --seeds=redpanda-1:33145, --rpc-addr=redpanda-1:33145, --advertise-rpc-addr=redpanda-1:33145,
       --kafka-addr=0.0.0.0:9092, --advertise-kafka-addr=redpanda-1:9092]
     volumes: ["redpanda-1:/var/lib/redpanda/data"]
     networks: { default: { ipv4_address: 172.30.77.21 } }   # fixed: a restarted broker must come back on the same address
   redpanda-2:
     <<: *redpanda
-    command: [redpanda, start, --smp=1, --memory=768M, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
+    command: [redpanda, start, --smp=1, --memory=1G, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
       --node-id=2, --seeds=redpanda-1:33145, --rpc-addr=redpanda-2:33145, --advertise-rpc-addr=redpanda-2:33145,
       --kafka-addr=0.0.0.0:9092, --advertise-kafka-addr=redpanda-2:9092]
     volumes: ["redpanda-2:/var/lib/redpanda/data"]
     networks: { default: { ipv4_address: 172.30.77.22 } }   # fixed: a restarted broker must come back on the same address
   redpanda-3:
     <<: *redpanda
-    command: [redpanda, start, --smp=1, --memory=768M, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
+    command: [redpanda, start, --smp=1, --memory=1G, --reserve-memory=0M, --overprovisioned, --check=false, --default-log-level=warn,
       --node-id=3, --seeds=redpanda-1:33145, --rpc-addr=redpanda-3:33145, --advertise-rpc-addr=redpanda-3:33145,
       --kafka-addr=0.0.0.0:9092, --advertise-kafka-addr=redpanda-3:9092]
     volumes: ["redpanda-3:/var/lib/redpanda/data"]

@@ -8,5 +8,5 @@ RUN dotnet publish -c Release -o /app --no-restore
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
 WORKDIR /app
 COPY --from=build /app .
-ENV ASPNETCORE_URLS=
+ENV ASPNETCORE_URLS= ASPNETCORE_HTTP_PORTS=
 ENTRYPOINT ["dotnet", "Gateway.dll"]

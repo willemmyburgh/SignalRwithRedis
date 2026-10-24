@@ -300,7 +300,7 @@ public sealed class ChatLogTail(ChatLog chatLog, LogDelivery delivery, ILogger<C
         }
         c.Assign(assign);
         _lastConsumed = DateTime.UtcNow;
-        log.LogWarning("tailing {Topic}: {Count} partitions", ChatLog.Topic, partitions.Length);
+        log.LogInformation("tailing {Topic}: {Count} partitions", ChatLog.Topic, partitions.Length);
         var nextCheck = DateTime.UtcNow.AddSeconds(5);
         while (!ct.IsCancellationRequested)
         {

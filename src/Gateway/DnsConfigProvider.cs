@@ -31,7 +31,7 @@ public sealed class DnsConfigProvider(IConfiguration config, ILogger<DnsConfigPr
                 if (key == _lastKey) continue;
                 _lastKey = key;
                 Publish(addresses);
-                log.LogWarning("upstream {Host}: {Count} destinations ({Addresses})", _host, addresses.Length, key);
+                log.LogInformation("upstream {Host}: {Count} destinations ({Addresses})", _host, addresses.Length, key);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
