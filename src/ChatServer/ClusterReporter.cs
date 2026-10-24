@@ -46,6 +46,9 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                     if (info is null || info.Ts < cutoff) dead.Add(e.Name!);
                     else live.Add(info);
                 }
+                var rebalance = (string?)await db.StringGetAsync(DemoKeys.Rebalance) != "0"; // default: on
+                if (rebalance) await ShedExcess(live, mine.Connections);
+
                 if (live.MinBy(s => s.Name, StringComparer.Ordinal)?.Name != me) continue; // not the leader
 
                 if (dead.Count > 0)
@@ -63,6 +66,7 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                     servers = live.OrderBy(s => s.Name, StringComparer.Ordinal),
                     clients,
                     redis = await RedisInfo(),
+                    rebalance,
                 }, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -70,6 +74,30 @@ public class ClusterReporter(IConnectionMultiplexer redis, IHubContext<ChatHub> 
                 log.LogWarning(ex, "cluster report failed");
             }
         }
+    }
+
+    private DateTime _lastShed = DateTime.MinValue;
+
+    /// <summary>
+    /// Connection rebalancing. WebSockets are long-lived, so a restarted or newly scaled-out server stays empty
+    /// while the others stay full. Each server compares its connection count with the cluster average and, when it is
+    /// clearly above it, asks a few of its own clients to reconnect. The load balancer (least-connections) then
+    /// sends them to the emptiest server. Small batches + a cooldown stop the cluster from over-correcting,
+    /// because heartbeats are up to a second stale.
+    /// </summary>
+    private async Task ShedExcess(List<ServerInfo> live, int mine)
+    {
+        if (live.Count < 2 || DateTime.UtcNow - _lastShed < TimeSpan.FromSeconds(3)) return;
+        var avg = live.Sum(s => s.Connections) / (double)live.Count;
+        var min = live.Min(s => s.Connections);
+        // Only servers above average shed, and only while the gap to the emptiest server exceeds a small dead band.
+        if (mine <= avg || mine - min <= avg * 0.08 + 2) return;
+
+        var excess = mine - (int)Math.Ceiling(avg);
+        var shed = Math.Min(50, Math.Max(1, (excess + 1) / 2));
+        _lastShed = DateTime.UtcNow;
+        log.LogInformation("rebalance: {Mine} connections vs avg {Avg:F0}, asking {Shed} clients to reconnect", mine, avg, shed);
+        await hub.Clients.Clients(ConnectionTracker.Sample(shed)).SendAsync("Reconnect");
     }
 
     private static async Task RemoveRosterEntries(IDatabase db, Func<string, bool> serverPredicate)

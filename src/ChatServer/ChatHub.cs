@@ -5,7 +5,7 @@ using StackExchange.Redis;
 
 namespace ChatServer;
 
-public record ClientInfo(string Name, string Server);
+public record ClientInfo(string Name, string Server, string Cid = "");
 
 public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubContext) : Hub
 {
@@ -23,13 +23,25 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
         var isVirtual = query["virtual"] == "1";
         Context.Items["virtual"] = isVirtual;
         ServerStats.ConnectionOpened(isVirtual);
+        ConnectionTracker.Add(Context.ConnectionId);
 
         if (!isVirtual)
         {
-            var name = query["name"].ToString().Trim();
-            if (name.Length == 0) name = "guest-" + Context.ConnectionId[..4];
-            Context.Items["name"] = Clean(name, 20);
+            Context.Items["cid"] = Clean(query["cid"].ToString(), 40);
+            string wanted;
+            if (query["auto"] == "1")
+            {
+                // No name chosen by the user: best effort = the device's network name, else what the browser told us.
+                var http = Context.GetHttpContext()!;
+                var known = DeviceNames.Known(http.Request.Headers.UserAgent.ToString());
+                var host = known is null ? await DeviceNames.ReverseDns(http) : null;
+                wanted = known ?? $"{host ?? Clean(query["device"].ToString(), 20)} · {Clean(query["browser"].ToString(), 12)}";
+            }
+            else wanted = query["name"].ToString().Trim();
+            if (wanted.Length == 0) wanted = "Device";
+            Context.Items["name"] = await UniqueName(Clean(wanted, 24));
             await RegisterClient();
+            await Clients.Caller.SendAsync("YourName", Name);
             await Clients.Caller.SendAsync("PollUpdate", await GetPoll());
         }
         await Clients.Caller.SendAsync("Connected", ServerName, Context.ConnectionId);
@@ -39,22 +51,47 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         ServerStats.ConnectionClosed(IsVirtual);
+        ConnectionTracker.Remove(Context.ConnectionId);
         if (!IsVirtual) await Db.HashDeleteAsync(DemoKeys.Clients, Context.ConnectionId);
         await base.OnDisconnectedAsync(exception);
     }
 
     private Task RegisterClient() =>
-        Db.HashSetAsync(DemoKeys.Clients, Context.ConnectionId, JsonSerializer.Serialize(new ClientInfo(Name, ServerName)));
+        Db.HashSetAsync(DemoKeys.Clients, Context.ConnectionId, JsonSerializer.Serialize(new ClientInfo(Name, ServerName, Context.Items["cid"] as string ?? "")));
 
     private static string Clean(string s, int max) => s.Length <= max ? s : s[..max];
 
     // ---- identity / latency -------------------------------------------------
 
-    public async Task SetName(string name)
+    public async Task<string> SetName(string name)
     {
-        if (IsVirtual) return;
-        Context.Items["name"] = Clean(name.Trim(), 20);
+        if (IsVirtual) return "";
+        Context.Items["name"] = await UniqueName(Clean(name.Trim().Length == 0 ? "Device" : name.Trim(), 24));
         await RegisterClient();
+        return Name;
+    }
+
+    /// <summary>
+    /// Several browsers/tabs on one device would otherwise share a name, so number them: "Mac · Chrome", "Mac · Chrome #2".
+    /// The same tab (same cid) reconnecting after a crash keeps its name.
+    /// </summary>
+    private async Task<string> UniqueName(string wanted)
+    {
+        var cid = Context.Items["cid"] as string ?? "";
+        var taken = new HashSet<string>();
+        foreach (var e in await Db.HashGetAllAsync(DemoKeys.Clients))
+        {
+            if (e.Name == Context.ConnectionId) continue;
+            var c = JsonSerializer.Deserialize<ClientInfo>((string)e.Value!, JsonSerializerOptions.Web);
+            if (c is null || (cid.Length > 0 && c.Cid == cid)) continue;
+            taken.Add(c.Name);
+        }
+        if (!taken.Contains(wanted)) return wanted;
+        for (var n = 2; ; n++)
+        {
+            var candidate = $"{wanted} #{n}";
+            if (!taken.Contains(candidate)) return candidate;
+        }
     }
 
     /// <summary>Round-trip probe: client -> server only (no backplane). Returns the answering instance.</summary>
@@ -152,6 +189,9 @@ public class ChatHub(IConnectionMultiplexer redis, IHubContext<ChatHub> hubConte
     public Task ReportBurst(string runId, int received, int expected, int ms, int outOfOrder) =>
         Clients.All.SendAsync("BurstReport", Name, ServerName, runId, received, expected, ms, outOfOrder);
 
+    /// <summary>Turn automatic connection rebalancing on/off for the whole cluster.</summary>
+    public Task SetRebalance(bool enabled) => Db.StringSetAsync(DemoKeys.Rebalance, enabled ? "1" : "0");
+
     /// <summary>Chaos: kill the instance handling this call. Docker restarts it; clients fail over.</summary>
     public async Task CrashServer()
     {
@@ -165,6 +205,7 @@ public static class DemoKeys
     public const string Clients = "demo:clients";
     public const string Servers = "demo:servers";
     public const string Poll = "demo:poll";
+    public const string Rebalance = "demo:rebalance";
 }
 
 public class CountingFilter : IHubFilter
@@ -198,4 +239,61 @@ public static class ServerStats
     }
 
     public static void Invocation() => Interlocked.Increment(ref _invocations);
+}
+
+/// <summary>Ids of the connections currently attached to THIS server instance.</summary>
+public static class ConnectionTracker
+{
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> Ids = new();
+    public static void Add(string id) => Ids[id] = 0;
+    public static void Remove(string id) => Ids.TryRemove(id, out _);
+    public static string[] Sample(int count)
+    {
+        var all = Ids.Keys.ToArray();
+        Random.Shared.Shuffle(all);
+        return all.Take(count).ToArray();
+    }
+}
+
+public static class DeviceNames
+{
+    /// <summary>
+    /// devices.json: [{"match": "regex on the User-Agent", "name": "Willem's iPhone"}, ...], first match wins.
+    /// Re-read on every connection, so edits apply without a restart.
+    /// </summary>
+    public static string? Known(string userAgent)
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "devices.json");
+            if (!File.Exists(path)) return null;
+            foreach (var d in JsonSerializer.Deserialize<List<KnownDevice>>(File.ReadAllText(path), JsonSerializerOptions.Web) ?? [])
+                if (!string.IsNullOrEmpty(d.Match) && System.Text.RegularExpressions.Regex.IsMatch(userAgent, d.Match)) return d.Name;
+        }
+        catch { /* bad file: fall back to automatic names */ }
+        return null;
+    }
+    private record KnownDevice(string Match, string Name);
+
+    /// <summary>
+    /// Reverse-DNS of the client's address (as seen by the load balancer). On a home/office LAN the router often
+    /// knows device names like "Willems-iPhone". Returns null when unknown or when the address is only the Docker gateway.
+    /// </summary>
+    public static async Task<string?> ReverseDns(HttpContext http)
+    {
+        var fwd = http.Request.Headers["X-Forwarded-For"].ToString().Split(',')[0].Trim();
+        if (!System.Net.IPAddress.TryParse(fwd, out var ip)) ip = http.Connection.RemoteIpAddress;
+        if (ip is null || System.Net.IPAddress.IsLoopback(ip)) return null;
+        var b = ip.MapToIPv4().GetAddressBytes();
+        if (b[0] == 172 && b[1] is >= 16 and <= 31) return null;      // Docker bridge networks
+        if (b[0] == 192 && b[1] == 168 && b[2] == 65) return null;    // Docker Desktop gateway
+        try
+        {
+            var host = (await System.Net.Dns.GetHostEntryAsync(ip).WaitAsync(TimeSpan.FromSeconds(1.5))).HostName;
+            if (System.Net.IPAddress.TryParse(host, out _)) return null;
+            host = host.Split('.')[0];
+            return host.Length is > 0 and <= 20 ? host : null;
+        }
+        catch { return null; }
+    }
 }

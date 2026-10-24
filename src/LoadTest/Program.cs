@@ -29,7 +29,10 @@ var connectTasks = Enumerable.Range(0, connections).Select(async i =>
     {
         var c = new HubConnectionBuilder()
             .WithUrl(url + (url.Contains('?') ? "&" : "?") + "virtual=1", o => { o.SkipNegotiation = true; o.Transports = HttpTransportType.WebSockets; })
+            .WithAutomaticReconnect(new ForeverRetry())
             .Build();
+        // The cluster asks clients to move when servers are unbalanced.
+        c.On("Reconnect", async () => { await Task.Delay(Random.Shared.Next(1500)); await c.StopAsync(); await c.StartAsync(); });
         c.On<string, string>("Connected", (s, _) => perServerConns.AddOrUpdate(s, 1, (_, n) => n + 1));
         c.On<string, string, string, long>("ReceiveMessage", (_, _, _, ticks) =>
         {
@@ -62,8 +65,12 @@ var sendTasks = clients.Take(senders).Select(async (c, idx) =>
     {
         while (await timer.WaitForNextTickAsync(cts.Token))
         {
-            await c.InvokeAsync("SendMessage", $"bot{idx}", "ping", Stopwatch.GetTimestamp());
-            Interlocked.Increment(ref sent);
+            try
+            {
+                await c.InvokeAsync("SendMessage", $"bot{idx}", "ping", Stopwatch.GetTimestamp());
+                Interlocked.Increment(ref sent);
+            }
+            catch (Exception) when (!cts.IsCancellationRequested) { Interlocked.Increment(ref failed); } // e.g. its server crashed
         }
     }
     catch (OperationCanceledException) { }
@@ -95,3 +102,9 @@ Console.WriteLine($"Latency ms:  p50={P(.5):F1} p95={P(.95):F1} p99={P(.99):F1} 
 await Task.WhenAll(clients.Select(c => c.DisposeAsync().AsTask()));
 
 static string Env(string k, string d) => Environment.GetEnvironmentVariable(k) ?? d;
+
+// Keep retrying every 1-3s so clients survive a server crash.
+sealed class ForeverRetry : IRetryPolicy
+{
+    public TimeSpan? NextRetryDelay(RetryContext c) => TimeSpan.FromMilliseconds(1000 + Random.Shared.Next(2000));
+}

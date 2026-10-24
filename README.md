@@ -1,16 +1,16 @@
 # SignalR scale-out with a Redis backplane
 
-Horizontally scaled ASP.NET Core SignalR (.NET 10) behind an nginx load balancer, with Redis as the backplane. Everything runs in Docker Compose.
+Horizontally scaled ASP.NET Core SignalR (.NET 10) behind an HAProxy load balancer, with Redis as the backplane. Everything runs in Docker Compose.
 
 ```
- browser / load test ──► nginx :9000 ──┬─► server-1 ─┐
+ browser / load test ──► HAProxy :9000 ──┬─► server-1 ─┐
                                        ├─► server-2 ─┼──► Redis (pub/sub backplane)
                                        └─► server-N ─┘
 ```
 
 - `src/ChatServer` – SignalR hub (`/chat`), `/stats`, `/healthz`, static demo page. Uses `Microsoft.AspNetCore.SignalR.StackExchangeRedis`.
 - `src/LoadTest` – console load generator (N connections, a few publishers, reports delivery %, throughput and p50/p95/p99 latency).
-- `nginx/nginx.conf` – WebSocket-aware round-robin load balancer; re-resolves Docker DNS so scaling needs no restart.
+- `HAProxy/HAProxy.conf` – WebSocket-aware round-robin load balancer; re-resolves Docker DNS so scaling needs no restart.
 
 ## Run
 
@@ -36,10 +36,18 @@ The page is a lab; every device sees the same live cluster panel (per-server con
 
 Device-side experiments can run on *all* devices at once from any device (devices can opt out with "accept remote commands").
 
+## Connection rebalancing
+
+WebSockets are long-lived, so after a crash, restart or `--scale` the new/empty server stays empty. Every server watches the cluster's heartbeats (Redis hash); a server above the cluster average, with a gap to the emptiest server beyond a small dead band, asks a few of its own clients to reconnect (`Reconnect` hub message, small batches, 3 s cooldown). Clients drop and reconnect with jitter, and HAProxy's `leastconn` sends them to the emptiest server. Toggle it from the cluster panel to compare. Example (5 servers, 500 connections, one server stopped and restarted): 101 each, then 127 each on four servers, then back to 103/94 within ~10 s.
+
+## Device names
+
+Browsers can't read a device's real name. Order used: a name you type (saved in the browser) → `src/ChatServer/devices.json` (`{"match": "<regex on User-Agent>", "name": "..."}`, edited live, no restart) → reverse DNS of the client address (only works when the real client IP reaches the server, which Docker Desktop hides) → browser-reported device + browser, e.g. `iPhone · Safari`. Duplicates are numbered (`Mac · Chrome`, `Mac · Chrome #2`; a different browser gets its own name). Edit `devices.json` with a tool that keeps the file inode (e.g. `cat >`), or restart the servers, because it is bind-mounted.
+
 ## Scale horizontally
 
 ```bash
-docker compose up -d --scale server=6
+docker compose up -d --scale server=6   # use --no-deps with `compose run`, or it resets to 3
 curl localhost:9000/stats           # repeat – responses come from different instances\n# the cluster panel on the page picks up new instances within a few seconds
 ```
 

@@ -31,8 +31,9 @@ app.UseStaticFiles();
 
 app.MapHub<ChatHub>("/chat");
 app.MapHealthChecks("/healthz");
-app.MapGet("/stats", () => new
+app.MapGet("/stats", (HttpContext http) => new
 {
+    clientIp = http.Request.Headers["X-Forwarded-For"].ToString(), // address as seen via the load balancer
     server = ChatHub.ServerName,
     connections = ServerStats.Connections,
     virtualConnections = ServerStats.VirtualConnections,

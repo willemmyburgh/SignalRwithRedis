@@ -1,0 +1,4 @@
+[
+  { "match": "__example__ Pixel 8", "name": "Alice's Pixel" },
+  { "match": "__example__ iPad",    "name": "Kitchen iPad" }
+]

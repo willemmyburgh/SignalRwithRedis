@@ -17,7 +17,7 @@
     <div id="status" class="pill">connecting…</div>
   </div>
   <div class="me">
-    <label>You <input id="name" maxlength="20" /></label>
+    <label>You <input id="name" maxlength="24" size="16" /></label>
     <span id="myServer" class="muted">–</span>
     <span class="muted">RTT <b id="rtt">–</b></span>
     <span class="muted">↓ <b id="rx">0</b>/s</span>
@@ -30,9 +30,10 @@
 <section class="card" id="cluster">
   <h2>Cluster <span class="muted" id="clusterSummary"></span></h2>
   <div id="servers"></div>
+  <label class="muted"><input type="checkbox" id="rebal" checked /> Auto-rebalance connections</label>
   <div id="redisLine" class="muted"></div>
   <details><summary id="clientsSummary">Clients online</summary><div id="clients"></div></details>
-  <p class="hint">Every colour is one server instance behind the load balancer. This panel is pushed to every client once a second, regardless of which server it is attached to.</p>
+  <p class="hint">Every colour is one server instance behind the load balancer. This panel is pushed to every client once a second, regardless of which server it is attached to. With auto-rebalance on, servers holding more than their share ask some clients to reconnect, and the load balancer (least-connections) sends them to the emptiest server. Try: crash a server (Experiments), or <code>--scale server=6</code>, and watch the bars even out. Untick it to see connections stay skewed.</p>
 </section>
 
 <nav id="tabs">

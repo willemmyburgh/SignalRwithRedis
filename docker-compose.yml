@@ -12,6 +12,7 @@ services:
     build: ./src/ChatServer
     environment:
       ConnectionStrings__Redis: redis:6379
+    volumes: ["./src/ChatServer/devices.json:/app/devices.json:ro"]   # friendly device names, editable live
     depends_on:
       redis: { condition: service_healthy }
     restart: unless-stopped
@@ -19,9 +20,9 @@ services:
       replicas: 3
 
   loadbalancer:
-    image: nginx:alpine
-    ports: ["9000:80"]
-    volumes: ["./nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    image: haproxy:lts-alpine
+    ports: ["9000:80", "8404:8404"]   # app, HAProxy stats dashboard
+    volumes: ["./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
     depends_on: [server]
 
   loadtest:              # run on demand: docker compose run --rm loadtest

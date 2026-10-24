@@ -12,22 +12,51 @@ function log(msg) {
   $("log").prepend(li); while ($("log").children.length > 80) $("log").lastChild.remove();
 }
 const retryPolicy = { nextRetryDelayInMilliseconds: c => Math.min(500 + c.previousRetryCount * 500, 5000) }; // never give up
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Server-requested rebalance: drop the socket and reconnect; the load balancer picks the emptiest server.
+async function bounce(c) {
+  await sleep(Math.random() * 1500); // jitter so a batch doesn't reconnect in lockstep
+  if (c._closed) return;
+  if (c === conn) { disconnectedAt = performance.now(); lostServer = state.server; rebalancing = true; }
+  try { await c.stop(); } catch { /* ignore */ }
+  while (!c._closed) { try { await c.start(); return; } catch { await sleep(1500); } }
+}
 function build(url, quiet) {
   // WebSockets only + skipNegotiation: no sticky sessions needed, any LB algorithm works.
-  return new signalR.HubConnectionBuilder()
+  const c = new signalR.HubConnectionBuilder()
     .withUrl(url, { skipNegotiation: true, transport: signalR.HttpTransportType.WebSockets })
     .withAutomaticReconnect(retryPolicy)
     .configureLogging(quiet ? signalR.LogLevel.None : signalR.LogLevel.Warning)
     .build();
+  c.on("Reconnect", () => bounce(c));
+  return c;
 }
 const pct = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(p * arr.length))] : NaN;
 const fmt = n => Number.isFinite(n) ? n.toFixed(1) : "–";
 
 // ---------- connection ----------
-let name = localStorage.getItem("name") || "guest-" + Math.random().toString(36).slice(2, 6);
-$("name").value = name;
-const conn = build(`/chat?name=${encodeURIComponent(name)}`);
-let disconnectedAt = 0, lostServer = null;
+// Browsers don't expose the real device name (privacy), so naming is best effort, in this order:
+//   1. a name the user typed (saved in this browser)      2. the device's network name, looked up by the server
+//   3. what the browser reveals (iPhone, Pixel 7, Windows, Mac …) + browser.
+// The server numbers duplicates, so two browsers on one device show as "Mac · Chrome" and "Mac · Safari",
+// two tabs of the same browser as "Mac · Chrome" and "Mac · Chrome #2".
+function deviceInfo() {
+  const ua = navigator.userAgent;
+  let device = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android" : /Windows/.test(ua) ? "Windows"
+    : /Mac OS X/.test(ua) ? "Mac" : /CrOS/.test(ua) ? "Chromebook" : /Linux/.test(ua) ? "Linux" : "Device";
+  const model = /Android[^;)]*; ([^;)]+)/.exec(ua)?.[1]?.trim();
+  if (model && model !== "K" && !/^(Mobile|wv)$/.test(model)) device = model;
+  const browser = /Edg\//.test(ua) ? "Edge" : /OPR\//.test(ua) ? "Opera" : /Firefox\//.test(ua) ? "Firefox" : /(Chrome|CriOS)\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+  return { device, browser };
+}
+let name = new URLSearchParams(location.search).get("name") || localStorage.getItem("customName") || "";
+let cid = sessionStorage.getItem("cid"); // per tab; lets the server recognise this tab after a reconnect
+if (!cid) { cid = Math.random().toString(36).slice(2, 12); sessionStorage.setItem("cid", cid); }
+const { device, browser } = deviceInfo();
+const nameQuery = name ? `name=${encodeURIComponent(name)}` : `auto=1&device=${encodeURIComponent(device)}&browser=${encodeURIComponent(browser)}`;
+$("name").value = name || `${device} · ${browser}`;
+const conn = build(`/chat?${nameQuery}&cid=${cid}`);
+let disconnectedAt = 0, lostServer = null, rebalancing = false;
 
 function setStatus(text, cls) { $("status").textContent = text; $("status").className = "pill " + (cls || ""); }
 
@@ -36,8 +65,9 @@ conn.on("Connected", async (server, id) => {
   $("myServer").replaceChildren("on ", chip(server));
   setStatus("connected", "ok");
   if (disconnectedAt) {
-    log(`reconnected to ${short(server)} after ${((performance.now() - disconnectedAt) / 1000).toFixed(1)}s (was on ${short(lostServer)})`);
-    disconnectedAt = 0;
+    const secs = ((performance.now() - disconnectedAt) / 1000).toFixed(1);
+    log(rebalancing ? `rebalanced: moved ${short(lostServer)} → ${short(server)} in ${secs}s` : `reconnected to ${short(server)} after ${secs}s (was on ${short(lostServer)})`);
+    disconnectedAt = 0; rebalancing = false;
   }
   for (const r of state.rooms) await conn.invoke("JoinRoom", r); // groups are per-connection: re-join
 });
@@ -53,9 +83,11 @@ setInterval(() => { $("rx").textContent = state.rx; state.rx = 0; $("reactRate")
 
 // ---------- name ----------
 $("name").onchange = async () => {
-  name = $("name").value.trim() || name; localStorage.setItem("name", name);
-  if (conn.state === "Connected") await conn.invoke("SetName", name);
+  const typed = $("name").value.trim(); if (!typed) return;
+  localStorage.setItem("customName", typed);
+  if (conn.state === "Connected") name = $("name").value = await conn.invoke("SetName", typed);
 };
+conn.on("YourName", n => { name = n; $("name").value = n; });
 
 // ---------- invite ----------
 $("inviteBtn").onclick = () => {
@@ -74,7 +106,9 @@ document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => {
 });
 
 // ---------- cluster panel ----------
+$("rebal").onchange = () => conn.invoke("SetRebalance", $("rebal").checked);
 conn.on("ClusterStats", s => {
+  $("rebal").checked = s.rebalance;
   const total = s.servers.reduce((a, x) => a + x.connections, 0), virt = s.servers.reduce((a, x) => a + x.virtualConnections, 0);
   $("clusterSummary").textContent = `· ${total} connections (${virt} virtual) on ${s.servers.length} servers`;
   const max = Math.max(1, ...s.servers.map(x => x.connections));
@@ -242,7 +276,7 @@ async function addVirtual(n) {
   }
 }
 async function closeVirtual() {
-  const vs = state.virtual.splice(0); await Promise.all(vs.map(v => v.stop())); $("vuCount").textContent = 0;
+  const vs = state.virtual.splice(0); vs.forEach(v => v._closed = true); await Promise.all(vs.map(v => v.stop())); $("vuCount").textContent = 0;
 }
 document.querySelectorAll(".vu").forEach(b => b.onclick = () => $("onAll").checked ? conn.invoke("RunOnAll", "virtual", +b.dataset.n, 0) : addVirtual(+b.dataset.n));
 $("vuStop").onclick = () => closeVirtual();
