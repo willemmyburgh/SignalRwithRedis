@@ -28,9 +28,9 @@ var connectTasks = Enumerable.Range(0, connections).Select(async i =>
     try
     {
         var c = new HubConnectionBuilder()
-            .WithUrl(url, o => { o.SkipNegotiation = true; o.Transports = HttpTransportType.WebSockets; })
+            .WithUrl(url + (url.Contains('?') ? "&" : "?") + "virtual=1", o => { o.SkipNegotiation = true; o.Transports = HttpTransportType.WebSockets; })
             .Build();
-        c.On<string>("Connected", s => perServerConns.AddOrUpdate(s, 1, (_, n) => n + 1));
+        c.On<string, string>("Connected", (s, _) => perServerConns.AddOrUpdate(s, 1, (_, n) => n + 1));
         c.On<string, string, string, long>("ReceiveMessage", (_, _, _, ticks) =>
         {
             Interlocked.Increment(ref received);

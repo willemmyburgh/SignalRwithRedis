@@ -21,11 +21,26 @@ open http://localhost:9000          # open in 2+ tabs; each shows which instance
 
 Messages sent in one tab appear in all tabs, even when the tabs are on different servers (the `via` tag shows the instance that processed the send).
 
+## Use it from other devices on your LAN
+
+Port 9000 is published on all interfaces. On phones/laptops open `http://willem-macs:9000` (or `http://willem-macs.local:9000`, or the Mac's IP; Android often needs the IP). The **Invite devices** button shows a QR code. If devices can't connect, check the macOS firewall.
+
+The page is a lab; every device sees the same live cluster panel (per-server connections, hub calls/s, Redis ops/s, clients online) and can trigger:
+
+| Tab | Demonstrates |
+|---|---|
+| Chat | `Clients.All` and groups (rooms A/B/C); tag shows which server handled the sender |
+| Canvas | real-time fan-out of pointer events |
+| Poll & React | shared state in Redis + backplane notifications; emoji floating on every screen |
+| Experiments | latency probe, server-side **burst** (loss/order/throughput reported by every device), multi-device **flood** (end-to-end latency via Redis), **virtual users** (each device opens up to 1000 extra connections), **chaos** (crash the server you're on and watch clients fail over) |
+
+Device-side experiments can run on *all* devices at once from any device (devices can opt out with "accept remote commands").
+
 ## Scale horizontally
 
 ```bash
 docker compose up -d --scale server=6
-curl localhost:9000/stats           # repeat – responses come from different instances
+curl localhost:9000/stats           # repeat – responses come from different instances\n# the cluster panel on the page picks up new instances within a few seconds
 ```
 
 ## Load test
@@ -45,4 +60,5 @@ Watch the backplane: `docker compose exec redis redis-cli monitor`.
 - **Sticky sessions not needed**: clients use `skipNegotiation` + WebSockets only. With the negotiate step or long-polling/SSE fallbacks you would need session affinity at the load balancer (the docs call this out).
 - **Backplane limits**: every message is published to Redis and fanned out to every server, so Redis traffic grows with messages × servers. For high fan-out, prefer groups/targeted sends over `Clients.All`.
 - **Redis is a single node here**; for production use a managed/clustered Redis with `ChannelPrefix` per app.
+- **Failure semantics**: crashed servers are restarted by Docker (`restart: unless-stopped`); clients reconnect with an unbounded retry policy and re-join groups. Messages during the gap are lost (backplane is at-most-once).
 - Stop everything: `docker compose down`.

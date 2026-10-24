@@ -1,16 +1,27 @@
+using Microsoft.AspNetCore.SignalR;
 using ChatServer;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
 var redis = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
 
-builder.Services.AddSignalR()
+builder.Services.AddSignalR(o => o.AddFilter<CountingFilter>())
     .AddStackExchangeRedis(redis, options =>
     {
         // Isolates this app's channels if the Redis instance is shared.
-        options.Configuration.ChannelPrefix = StackExchange.Redis.RedisChannel.Literal("SignalRScaleDemo");
+        options.Configuration.ChannelPrefix = RedisChannel.Literal("SignalRScaleDemo");
     });
 
+// Separate multiplexer for the demo's own shared state (poll, roster, server heartbeats).
+builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+{
+    var cfg = ConfigurationOptions.Parse(redis);
+    cfg.AbortOnConnectFail = false;
+    cfg.AllowAdmin = true; // needed for INFO (Redis stats panel)
+    return ConnectionMultiplexer.Connect(cfg);
+});
+builder.Services.AddHostedService<ClusterReporter>();
 builder.Services.AddHealthChecks();
 
 var app = builder.Build();
@@ -24,7 +35,8 @@ app.MapGet("/stats", () => new
 {
     server = ChatHub.ServerName,
     connections = ServerStats.Connections,
-    messagesSent = ServerStats.Messages,
+    virtualConnections = ServerStats.VirtualConnections,
+    hubCalls = ServerStats.Invocations,
 });
 
 app.Run();

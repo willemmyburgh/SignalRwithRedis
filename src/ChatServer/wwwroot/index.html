@@ -3,69 +3,124 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SignalR + Redis scale-out</title>
+  <title>SignalR + Redis scale-out lab</title>
+  <link rel="stylesheet" href="style.css" />
   <script src="lib/signalr.min.js"></script>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
-    .row { display: flex; gap: .5rem; margin-bottom: .5rem; }
-    input { padding: .4rem; } #message { flex: 1; }
-    #me { padding: .5rem; background: #eef; border-radius: 6px; margin-bottom: 1rem; }
-    #messages { list-style: none; padding: 0; }
-    #messages li { padding: .3rem .5rem; border-bottom: 1px solid #eee; }
-    .srv { float: right; color: #888; font: .8rem monospace; }
-    table { border-collapse: collapse; margin-top: 1rem; } td, th { padding: .2rem .8rem; border: 1px solid #ddd; }
-  </style>
+  <script src="lib/qrcode.min.js"></script>
 </head>
 <body>
-  <h2>SignalR Redis multi-server demo</h2>
-  <div id="me">Connecting&hellip;</div>
-  <div class="row">
-    <input id="user" placeholder="Name" value="anon" size="10" />
-    <input id="message" placeholder="Message" />
-    <button id="send">Send</button>
+<div id="fx"></div>
+
+<header>
+  <div class="top">
+    <h1>SignalR × Redis <small>scale-out lab</small></h1>
+    <div id="status" class="pill">connecting…</div>
   </div>
+  <div class="me">
+    <label>You <input id="name" maxlength="20" /></label>
+    <span id="myServer" class="muted">–</span>
+    <span class="muted">RTT <b id="rtt">–</b></span>
+    <span class="muted">↓ <b id="rx">0</b>/s</span>
+    <label class="muted"><input type="checkbox" id="accept" checked /> accept remote commands</label>
+    <button id="inviteBtn" class="ghost">Invite devices</button>
+  </div>
+  <div id="invite" hidden><canvas id="qr"></canvas><div><b id="inviteUrl"></b><p class="muted">Scan or type this on any phone/computer on the same network.</p></div></div>
+</header>
+
+<section class="card" id="cluster">
+  <h2>Cluster <span class="muted" id="clusterSummary"></span></h2>
+  <div id="servers"></div>
+  <div id="redisLine" class="muted"></div>
+  <details><summary id="clientsSummary">Clients online</summary><div id="clients"></div></details>
+  <p class="hint">Every colour is one server instance behind the load balancer. This panel is pushed to every client once a second, regardless of which server it is attached to.</p>
+</section>
+
+<nav id="tabs">
+  <button data-tab="chat" class="on">💬 Chat</button>
+  <button data-tab="draw">🎨 Canvas</button>
+  <button data-tab="poll">📊 Poll &amp; React</button>
+  <button data-tab="lab">🧪 Experiments</button>
+</nav>
+
+<section class="tab card" id="tab-chat">
+  <p class="hint"><b>What it shows:</b> <code>Clients.All</code> and <code>Clients.Group</code> reach every device on every server. The tag on each message is the server that handled the <i>sender's</i> call. Join rooms to see targeted delivery: messages to a room only reach its members.</p>
+  <div class="chips" id="rooms"></div>
   <ul id="messages"></ul>
-  <h3>Server instances (via load balancer)</h3>
-  <button id="refresh">Sample /stats 10x</button>
-  <table id="stats"></table>
+  <div class="row"><select id="sendTo"><option value="">Everyone</option></select><input id="message" placeholder="Message" /><button id="send">Send</button></div>
+</section>
 
-  <script>
-    const $ = id => document.getElementById(id);
-    // WebSockets only + skipNegotiation: the connection never needs sticky sessions,
-    // so any load balancer algorithm works.
-    const connection = new signalR.HubConnectionBuilder()
-      .withUrl("/chat", { skipNegotiation: true, transport: signalR.HttpTransportType.WebSockets })
-      .withAutomaticReconnect()
-      .build();
+<section class="tab card" id="tab-draw" hidden>
+  <p class="hint"><b>What it shows:</b> real-time fan-out of pointer events. Draw here and watch the strokes appear on every other device. (Late joiners see only new strokes: the backplane relays messages, it doesn't store them.)</p>
+  <canvas id="board" width="800" height="600"></canvas>
+  <div class="row"><span id="colors"></span><button id="clear" class="ghost">Clear for everyone</button></div>
+</section>
 
-    connection.on("Connected", server => $("me").textContent = `Connected to server instance: ${server}`);
-    connection.on("ReceiveMessage", (user, message, server) => {
-      const li = document.createElement("li");
-      li.textContent = `${user}: ${message}`;
-      const s = document.createElement("span"); s.className = "srv"; s.textContent = `via ${server}`;
-      li.prepend(s);
-      $("messages").prepend(li);
-    });
-    connection.onreconnected(() => $("me").textContent += " (reconnected)");
+<section class="tab card" id="tab-poll" hidden>
+  <p class="hint"><b>What it shows:</b> shared <i>state</i> (vote counts) lives in Redis itself; the backplane only tells everyone to refresh. Tap rapidly from several devices.</p>
+  <h3>Best snack?</h3>
+  <div id="poll"></div>
+  <button id="resetPoll" class="ghost">Reset votes</button>
+  <h3>Reactions</h3>
+  <div class="row wrap" id="emojis"></div>
+  <p class="muted"><span id="reactRate">0</span> reactions/s across the cluster</p>
+</section>
 
-    $("send").onclick = async () => {
-      const msg = $("message").value; if (!msg) return;
-      await connection.invoke("SendMessage", $("user").value, msg, 0);
-      $("message").value = "";
-    };
-    $("message").onkeydown = e => { if (e.key === "Enter") $("send").click(); };
+<section class="tab" id="tab-lab" hidden>
+  <div class="card">
+    <h3>Target</h3>
+    <label><input type="checkbox" id="onAll" checked /> Run device-side experiments on <b>all</b> devices that accept remote commands</label>
+    <button id="stopAll" class="danger">⏹ Stop everything on all devices</button>
+  </div>
 
-    $("refresh").onclick = async () => {
-      const seen = {};
-      for (let i = 0; i < 10; i++) {
-        const s = await (await fetch("/stats", { cache: "no-store", headers: { Connection: "close" } })).json();
-        seen[s.server] = s;
-      }
-      $("stats").innerHTML = "<tr><th>Server</th><th>WS connections</th><th>Messages sent</th></tr>" +
-        Object.values(seen).map(s => `<tr><td>${s.server}</td><td>${s.connections}</td><td>${s.messagesSent}</td></tr>`).join("");
-    };
+  <div class="card">
+    <h3>1 · Latency probe</h3>
+    <p class="hint">Round-trip time from this device to its server (WebSocket + load balancer). Compare phone on Wi-Fi vs. laptop.</p>
+    <button id="pingBtn">Ping ×20</button> <span id="pingOut" class="muted"></span>
+  </div>
 
-    connection.start().catch(e => $("me").textContent = "Failed: " + e);
-  </script>
+  <div class="card">
+    <h3>2 · Server burst (fan-out + backplane throughput)</h3>
+    <p class="hint">The <i>server you're on</i> publishes N messages to <b>every connected client</b> through Redis. Each device counts what it receives (loss, ordering, msgs/s) and reports back below.</p>
+    <div class="row wrap">
+      <label>Messages <select id="burstCount"><option>100</option><option selected>1000</option><option>5000</option><option>20000</option></select></label>
+      <label>Payload <select id="burstSize"><option value="0">tiny</option><option value="1024">1 KB</option><option value="8192">8 KB</option></select></label>
+      <label>Rate <select id="burstRate"><option value="0">max</option><option value="100">100/s</option><option value="500" selected>500/s</option><option value="2000">2000/s</option></select></label>
+      <button id="burstBtn">Run burst</button>
+    </div>
+    <div id="burstLive" class="muted"></div>
+    <table id="burstTable"><thead><tr><th>Device</th><th>Server</th><th>Got</th><th>Rate</th><th>Out of order</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>3 · Flood (many senders → many receivers)</h3>
+    <p class="hint">Each device sends tiny messages to everyone at the chosen rate. Total deliveries/s = devices × rate × connections. Each device times its <i>own</i> messages coming back through Redis (end-to-end latency).</p>
+    <div class="row wrap">
+      <label>Per device <select id="floodRate"><option value="5">5/s</option><option value="20" selected>20/s</option><option value="50">50/s</option></select></label>
+      <label>For <select id="floodSecs"><option>10</option><option selected>20</option><option>60</option></select> s</label>
+      <button id="floodBtn">Start flood</button>
+    </div>
+    <div id="floodOut" class="muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>4 · Virtual users (connection scale)</h3>
+    <p class="hint">Opens extra WebSocket connections from this browser (every one is a real client, spread over the servers). Ten phones × 200 = 2,000 connections. Each virtual user also receives all broadcasts.</p>
+    <div class="row wrap">
+      <button class="vu" data-n="50">+50</button><button class="vu" data-n="200">+200</button><button class="vu" data-n="500">+500</button>
+      <button id="vuStop" class="ghost">Close mine</button>
+    </div>
+    <div class="muted">This device: <b id="vuCount">0</b> virtual connections open</div>
+  </div>
+
+  <div class="card">
+    <h3>5 · Chaos: crash a server</h3>
+    <p class="hint">Kills the instance this device is connected to. Docker restarts it; all its clients reconnect to the survivors and re-join their rooms. Watch the cluster panel and the event log. Messages sent in the gap are lost (SignalR + Redis is at-most-once).</p>
+    <button id="crashBtn" class="danger">💥 Crash my server</button>
+  </div>
+
+  <div class="card"><h3>Event log</h3><ul id="log"></ul></div>
+</section>
+
+<script src="app.js"></script>
 </body>
 </html>

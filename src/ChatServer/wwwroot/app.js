@@ -1,0 +1,264 @@
+const $ = id => document.getElementById(id);
+const short = s => (s || "?").slice(0, 6);
+const state = { id: null, server: null, rooms: new Set(), virtual: [], rx: 0, flood: null, burst: null, reactions: 0 };
+
+// ---------- helpers ----------
+function color(server) { let h = 0; for (const c of server || "?") h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 62% 42%)`; }
+function chip(server, text) {
+  const s = document.createElement("span"); s.className = "chip"; s.style.background = color(server); s.textContent = text ?? short(server); return s;
+}
+function log(msg) {
+  const li = document.createElement("li"); li.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  $("log").prepend(li); while ($("log").children.length > 80) $("log").lastChild.remove();
+}
+const retryPolicy = { nextRetryDelayInMilliseconds: c => Math.min(500 + c.previousRetryCount * 500, 5000) }; // never give up
+function build(url, quiet) {
+  // WebSockets only + skipNegotiation: no sticky sessions needed, any LB algorithm works.
+  return new signalR.HubConnectionBuilder()
+    .withUrl(url, { skipNegotiation: true, transport: signalR.HttpTransportType.WebSockets })
+    .withAutomaticReconnect(retryPolicy)
+    .configureLogging(quiet ? signalR.LogLevel.None : signalR.LogLevel.Warning)
+    .build();
+}
+const pct = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(p * arr.length))] : NaN;
+const fmt = n => Number.isFinite(n) ? n.toFixed(1) : "–";
+
+// ---------- connection ----------
+let name = localStorage.getItem("name") || "guest-" + Math.random().toString(36).slice(2, 6);
+$("name").value = name;
+const conn = build(`/chat?name=${encodeURIComponent(name)}`);
+let disconnectedAt = 0, lostServer = null;
+
+function setStatus(text, cls) { $("status").textContent = text; $("status").className = "pill " + (cls || ""); }
+
+conn.on("Connected", async (server, id) => {
+  state.id = id; state.server = server;
+  $("myServer").replaceChildren("on ", chip(server));
+  setStatus("connected", "ok");
+  if (disconnectedAt) {
+    log(`reconnected to ${short(server)} after ${((performance.now() - disconnectedAt) / 1000).toFixed(1)}s (was on ${short(lostServer)})`);
+    disconnectedAt = 0;
+  }
+  for (const r of state.rooms) await conn.invoke("JoinRoom", r); // groups are per-connection: re-join
+});
+conn.onreconnecting(() => { disconnectedAt = performance.now(); lostServer = state.server; setStatus("reconnecting…", ""); log(`lost connection to ${short(state.server)}, retrying…`); });
+conn.onclose(() => { setStatus("disconnected", "bad"); });
+
+async function start() {
+  try { await conn.start(); } catch { setStatus("retrying…"); setTimeout(start, 2000); }
+}
+
+// ---------- rx counter ----------
+setInterval(() => { $("rx").textContent = state.rx; state.rx = 0; $("reactRate").textContent = state.reactions; state.reactions = 0; }, 1000);
+
+// ---------- name ----------
+$("name").onchange = async () => {
+  name = $("name").value.trim() || name; localStorage.setItem("name", name);
+  if (conn.state === "Connected") await conn.invoke("SetName", name);
+};
+
+// ---------- invite ----------
+$("inviteBtn").onclick = () => {
+  const box = $("invite"); box.hidden = !box.hidden; if (box.hidden) return;
+  $("inviteUrl").textContent = location.origin;
+  const qr = qrcode(0, "M"); qr.addData(location.origin); qr.make();
+  const n = qr.getModuleCount(), px = 4, c = $("qr"); c.width = c.height = (n + 2) * px;
+  const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.fillStyle = "#000";
+  for (let r = 0; r < n; r++) for (let q = 0; q < n; q++) if (qr.isDark(r, q)) g.fillRect((q + 1) * px, (r + 1) * px, px, px);
+};
+
+// ---------- tabs ----------
+document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".tab").forEach(t => t.hidden = t.id !== "tab-" + b.dataset.tab);
+});
+
+// ---------- cluster panel ----------
+conn.on("ClusterStats", s => {
+  const total = s.servers.reduce((a, x) => a + x.connections, 0), virt = s.servers.reduce((a, x) => a + x.virtualConnections, 0);
+  $("clusterSummary").textContent = `· ${total} connections (${virt} virtual) on ${s.servers.length} servers`;
+  const max = Math.max(1, ...s.servers.map(x => x.connections));
+  $("servers").replaceChildren(...s.servers.map(x => {
+    const row = document.createElement("div"); row.className = "srvrow" + (x.name === state.server ? " mine" : "");
+    const bar = document.createElement("div"); bar.className = "bar"; const i = document.createElement("i");
+    i.style.width = (100 * x.connections / max) + "%"; i.style.background = color(x.name); bar.append(i);
+    const txt = document.createElement("span"); txt.textContent = `${x.connections} conn · ${x.callsPerSec}/s`;
+    row.append(chip(x.name), bar, txt); return row;
+  }));
+  $("redisLine").textContent = `Redis ${s.redis.version}: ${s.redis.opsPerSec} ops/s · ${s.redis.connectedClients} connections (one per server) · ${s.redis.memory}`;
+  $("clientsSummary").textContent = `Clients online (${s.clients.length})`;
+  $("clients").replaceChildren(...s.clients.map(c => chip(c.server, c.name)));
+});
+conn.on("Notice", t => { log(t); });
+
+// ---------- chat ----------
+function addMsg(user, text, server, room) {
+  state.rx++;
+  const li = document.createElement("li");
+  li.append(chip(server)); if (room) { const r = chip("", "room " + room); r.classList.add("room"); r.style.background = ""; li.append(r); }
+  li.append(`${user}: ${text}`); $("messages").prepend(li);
+  while ($("messages").children.length > 100) $("messages").lastChild.remove();
+}
+conn.on("ReceiveMessage", (u, m, s) => addMsg(u, m, s));
+conn.on("RoomMessage", (u, m, s, room) => addMsg(u, m, s, room));
+for (const r of ["A", "B", "C"]) {
+  const b = document.createElement("button"); b.textContent = "Room " + r; $("rooms").append(b);
+  b.onclick = async () => {
+    const joined = !state.rooms.has(r);
+    await conn.invoke(joined ? "JoinRoom" : "LeaveRoom", r);
+    joined ? state.rooms.add(r) : state.rooms.delete(r);
+    b.classList.toggle("on", joined);
+    $("sendTo").replaceChildren(new Option("Everyone", ""), ...[...state.rooms].sort().map(x => new Option("Room " + x, x)));
+  };
+}
+$("send").onclick = async () => {
+  const m = $("message").value.trim(); if (!m) return;
+  const room = $("sendTo").value;
+  await (room ? conn.invoke("SendToRoom", room, name, m) : conn.invoke("SendMessage", name, m, 0));
+  $("message").value = "";
+};
+$("message").onkeydown = e => { if (e.key === "Enter") $("send").click(); };
+
+// ---------- canvas ----------
+const board = $("board"), g = board.getContext("2d");
+let pen = "#2563eb", drawing = false, last = null, buf = [];
+for (const c of ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#111111"]) {
+  const b = document.createElement("button"); b.style.background = c; b.onclick = () => { pen = c; [...$("colors").children].forEach(x => x.classList.toggle("on", x === b)); };
+  if (c === pen) b.classList.add("on"); $("colors").append(b);
+}
+function seg(c, x0, y0, x1, y1) {
+  g.strokeStyle = c; g.lineWidth = 4; g.lineCap = "round"; g.beginPath();
+  g.moveTo(x0 * board.width, y0 * board.height); g.lineTo(x1 * board.width, y1 * board.height); g.stroke();
+}
+const pos = e => { const r = board.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; };
+board.onpointerdown = e => { drawing = true; last = pos(e); board.setPointerCapture(e.pointerId); };
+board.onpointerup = board.onpointercancel = () => { drawing = false; };
+board.onpointermove = e => {
+  if (!drawing) return; const p = pos(e);
+  seg(pen, ...last, ...p); buf.push(...last, ...p); last = p;
+};
+setInterval(() => { if (buf.length && conn.state === "Connected") { conn.send("Draw", pen, buf); buf = []; } }, 40);
+conn.on("Draw", (c, s) => { state.rx++; for (let i = 0; i + 3 < s.length; i += 4) seg(c, s[i], s[i + 1], s[i + 2], s[i + 3]); });
+conn.on("ClearCanvas", () => g.clearRect(0, 0, board.width, board.height));
+$("clear").onclick = () => conn.invoke("ClearCanvas");
+
+// ---------- poll + reactions ----------
+const options = ["🍕 Pizza", "🍔 Burger", "🌮 Taco", "🥗 Salad"];
+options.forEach((o, i) => {
+  const row = document.createElement("div"); row.className = "pollrow"; row.id = "p" + i;
+  row.innerHTML = `<span>${o}</span><div class="bar"><i></i></div><b>0</b>`;
+  row.onclick = () => conn.send("Vote", i); $("poll").append(row);
+});
+conn.on("PollUpdate", t => {
+  state.rx++; const max = Math.max(1, ...t);
+  t.forEach((v, i) => { const r = $("p" + i); r.querySelector("i").style.width = (100 * v / max) + "%"; r.querySelector("b").textContent = v; });
+});
+$("resetPoll").onclick = () => conn.invoke("ResetPoll");
+for (const e of ["👍", "❤️", "🎉", "🔥", "😂", "🚀"]) {
+  const b = document.createElement("button"); b.textContent = e; b.onclick = () => conn.send("React", e); $("emojis").append(b);
+}
+conn.on("Reaction", (emoji, server) => {
+  state.rx++; state.reactions++;
+  const d = document.createElement("div"); d.className = "float"; d.textContent = emoji;
+  d.style.left = Math.random() * 90 + "vw"; d.style.filter = `drop-shadow(0 0 6px ${color(server)})`;
+  $("fx").append(d); setTimeout(() => d.remove(), 3000);
+});
+
+// ---------- experiments: latency ----------
+setInterval(async () => {
+  if (conn.state !== "Connected") return;
+  const t = performance.now(); await conn.invoke("Ping"); $("rtt").textContent = Math.round(performance.now() - t) + " ms";
+}, 3000);
+$("pingBtn").onclick = async () => {
+  const xs = [];
+  for (let i = 0; i < 20; i++) { const t = performance.now(); await conn.invoke("Ping"); xs.push(performance.now() - t); }
+  xs.sort((a, b) => a - b);
+  $("pingOut").textContent = `min ${fmt(xs[0])} · p50 ${fmt(pct(xs, .5))} · p95 ${fmt(pct(xs, .95))} · max ${fmt(xs.at(-1))} ms`;
+};
+
+// ---------- experiments: server burst ----------
+const reports = {};
+$("burstBtn").onclick = async () => {
+  const r = await conn.invoke("StartBurst", +$("burstCount").value, +$("burstSize").value, +$("burstRate").value);
+  if (r === "busy") log("a burst is already running on this server");
+};
+conn.on("BurstStart", (id, count, server, by, bytes) => {
+  state.burst = { id, expected: count, got: 0, last: 0, ooo: 0, first: 0, lastAt: 0 };
+  $("burstLive").textContent = `Burst ${id}: ${count} × ${bytes}B from ${short(server)}, started by ${by}…`;
+  log(`burst ${id} started by ${by} on ${short(server)} (${count} msgs)`);
+});
+conn.on("BurstMsg", (id, seq) => {
+  const b = state.burst; if (!b || b.id !== id) return;
+  const now = performance.now(); b.first ||= now; b.lastAt = now; b.got++; state.rx++;
+  if (seq < b.last) b.ooo++; b.last = Math.max(b.last, seq);
+  if (b.got % 50 === 0) $("burstLive").textContent = `Burst ${id}: received ${b.got}/${b.expected}`;
+});
+conn.on("BurstEnd", (id) => setTimeout(() => {
+  const b = state.burst; if (!b || b.id !== id) return;
+  const ms = Math.max(1, b.lastAt - b.first);
+  $("burstLive").textContent = `Burst ${id} done: ${b.got}/${b.expected} received (${(100 * b.got / b.expected).toFixed(1)}%)`;
+  conn.send("ReportBurst", id, b.got, b.expected, Math.round(ms), b.ooo);
+}, 1000));
+conn.on("BurstReport", (who, server, id, got, expected, ms, ooo) => {
+  if (state.burst?.id !== id) { for (const k in reports) delete reports[k]; }
+  reports[who] = { server, got, expected, ms, ooo };
+  const body = $("burstTable").tBodies[0]; body.replaceChildren();
+  for (const [n, r] of Object.entries(reports)) {
+    const tr = body.insertRow(); tr.insertCell().textContent = n; tr.insertCell().append(chip(r.server));
+    tr.insertCell().textContent = `${r.got}/${r.expected}`; tr.insertCell().textContent = `${Math.round(r.got * 1000 / r.ms)}/s`; tr.insertCell().textContent = r.ooo;
+  }
+});
+
+// ---------- experiments: flood ----------
+function startFlood(rate, secs) {
+  stopFlood();
+  const f = state.flood = { sent: 0, got: 0, lat: [], bySrv: {}, timer: null, until: performance.now() + secs * 1000 };
+  const per = Math.max(1, Math.round(rate / 10));
+  f.timer = setInterval(() => {
+    if (performance.now() > f.until || conn.state !== "Connected") return stopFlood(true);
+    for (let i = 0; i < per; i++) { conn.send("Noise", state.id, performance.now()); f.sent++; }
+  }, 1000 / (rate / per));
+  log(`flood started: ${rate}/s for ${secs}s`);
+}
+function stopFlood(done) { if (state.flood?.timer) { clearInterval(state.flood.timer); state.flood.timer = null; if (done) log("flood finished"); } }
+conn.on("Noise", (from, server, t) => {
+  state.rx++; const f = state.flood; if (!f) return; f.got++;
+  if (from === state.id) { f.lat.push(performance.now() - t); if (f.lat.length > 3000) f.lat.shift(); }
+});
+setInterval(() => {
+  const f = state.flood; if (!f) return;
+  const l = [...f.lat].sort((a, b) => a - b);
+  $("floodOut").textContent = `${f.timer ? "running" : "stopped"} · sent ${f.sent} · received (from everyone) ${f.got} · own latency via Redis p50 ${fmt(pct(l, .5))} p95 ${fmt(pct(l, .95))} p99 ${fmt(pct(l, .99))} ms`;
+}, 500);
+
+// ---------- experiments: virtual users ----------
+async function addVirtual(n) {
+  n = Math.min(n, 1000 - state.virtual.length); log(`opening ${n} virtual connections`);
+  for (let i = 0; i < n; i += 10) {
+    await Promise.all(Array.from({ length: Math.min(10, n - i) }, async () => {
+      const c = build(`/chat?virtual=1`, true);
+      try { await c.start(); state.virtual.push(c); $("vuCount").textContent = state.virtual.length; } catch { /* ignore */ }
+    }));
+  }
+}
+async function closeVirtual() {
+  const vs = state.virtual.splice(0); await Promise.all(vs.map(v => v.stop())); $("vuCount").textContent = 0;
+}
+document.querySelectorAll(".vu").forEach(b => b.onclick = () => $("onAll").checked ? conn.invoke("RunOnAll", "virtual", +b.dataset.n, 0) : addVirtual(+b.dataset.n));
+$("vuStop").onclick = () => closeVirtual();
+
+// ---------- remote commands ----------
+$("floodBtn").onclick = () => $("onAll").checked ? conn.invoke("RunOnAll", "flood", +$("floodRate").value, +$("floodSecs").value) : startFlood(+$("floodRate").value, +$("floodSecs").value);
+$("stopAll").onclick = () => conn.invoke("RunOnAll", "stop", 0, 0);
+conn.on("Command", (cmd, a, b, by) => {
+  if (!$("accept").checked) return;
+  log(`command from ${by}: ${cmd} ${a || ""} ${b || ""}`);
+  if (cmd === "virtual") addVirtual(a);
+  else if (cmd === "flood") startFlood(a, b);
+  else if (cmd === "stop") { stopFlood(true); closeVirtual(); }
+});
+
+// ---------- chaos ----------
+$("crashBtn").onclick = () => { if (confirm("Crash the server you are connected to?")) conn.send("CrashServer"); };
+
+start();
