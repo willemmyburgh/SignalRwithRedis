@@ -19,7 +19,7 @@ It answers four practical questions about running real-time .NET services at sca
 3. **Can a message be made not to get lost?** The default path (Redis pub/sub) can lose messages, and the lab measures how many. The durable path (Redpanda replicated log plus resume offsets) loses none in every injected failure (audited, 0 missing).
 4. **How do you keep all this runnable by one command?** Everything is Docker Compose: 3 servers, gateway, 3 Redis, 3 Sentinels, 3 Redpanda brokers, console. Data volumes survive `docker compose down -v`.
 
-It is a learning and measurement lab, not a production template: no authentication, one Docker host, Redis not persisted. Documentation map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how it fits together), [docs/USER-MANUAL.md](docs/USER-MANUAL.md) (the web page, tab by tab), and the sections below (measurements and lessons).
+It is a learning and measurement lab, not a production template: no authentication, one Docker host, Redis not persisted. Documentation map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how it fits together), [docs/USER-MANUAL.md](docs/USER-MANUAL.md) (the web page, tab by tab), [docs/SHARDING.md](docs/SHARDING.md) (considerations for spreading the Everyone traffic over partitions), and the sections below (measurements and lessons).
 
 ## Requirements
 
